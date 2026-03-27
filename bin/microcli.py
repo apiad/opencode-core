@@ -351,7 +351,7 @@ def print_framework_help():
 
     print(f"""
 {bold}╔══════════════════════════════════════════════════════════════════════════════╗
-║                              MICROCLI FRAMEWORK                               ║
+║                              MICROCLI FRAMEWORK                              ║
 ║                  Lean CLI tools for AI-friendly micro-apps                   ║
 ╚══════════════════════════════════════════════════════════════════════════════╝{nc}
 
