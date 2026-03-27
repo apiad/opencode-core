@@ -1,24 +1,26 @@
-# OpenCode Framework Core
+# OpenCode Core
 
-OpenCode is an intelligent, multi-agent CLI framework for software engineering automation.
+**This is an internal repository.** Do not use directly.
 
-## Core Concepts
+This repository contains the framework runtime (agents, commands, and tools) used by [apiad/opencode](https://github.com/apiad/opencode).
 
-- **Agents**: Specialized AI agents (analyze, plan, build, release) with distinct responsibilities
-- **Commands**: Structured workflows (`/research`, `/build`, `/fix`, `/commit`, etc.)
-- **Intelligent Decisions**: Agents explain reasoning rather than enforcing deterministic rules
-- **Evidence-Based**: Every claim cites specific sources
+For installation and usage instructions, please visit: **[https://github.com/apiad/opencode](https://github.com/apiad/opencode)**
 
-## Directory Structure
+## What's Inside
 
+- `agents/` — Agent definitions for the OpenCode AI framework
+- `commands/` — Slash commands for structured workflows
+- `bin/` — CLI utilities
+- `instructions.md` — Framework documentation
+
+## Installation
+
+Use the installer from [apiad/opencode](https://github.com/apiad/opencode):
+
+```bash
+curl -fsSL https://apiad.github.io/opencode/install.sh | bash
 ```
-opencode-core/
-├── agents/     # Agent definitions and instructions
-├── commands/   # Command workflows and prompts
-├── bin/        # Utility scripts
-└── instructions.md  # Framework constitution
-```
 
-## License
+## Version
 
-MIT
+This repository follows [semantic versioning](https://semver.org/). The `main` branch tracks the latest stable release.
