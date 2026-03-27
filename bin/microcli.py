@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Lean CLI framework for AI-friendly micro-apps."""
 import argparse
+import ast
 import os
+import re
 import sys
 import subprocess
 import shlex
@@ -10,7 +12,7 @@ import pathlib
 import contextlib
 import time
 from typing import Annotated, Callable, Optional, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 __version__ = "0.1.0"
@@ -38,6 +40,291 @@ class Result:
 
 _dry_run = False
 _commands = {}
+
+# ============================================================================
+# MARK: Learn Mode (--learn)
+# ============================================================================
+
+@dataclass
+class LearnStep:
+    """A step in the command tour."""
+    command: str
+    args: dict
+    message: str
+    guard: str = ""
+    line: int = 0
+
+@dataclass
+class CommandTour:
+    """Tour information for a command."""
+    name: str
+    description: str
+    steps: list[LearnStep] = field(default_factory=list)
+
+
+class ExplainVisitor(ast.NodeVisitor):
+    """AST visitor to find .explain() calls and their context."""
+    
+    def __init__(self, source_lines: list[str]):
+        self.source_lines = source_lines
+        self.explain_calls: list[dict] = []
+        self._info_messages: list[tuple[int, str]] = []
+        self._current_if_guard: str = ""
+        self._in_if_block = False
+    
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        """Track which command function we're in."""
+        self._current_func = node.name
+        self._info_messages = []
+        self._in_if_block = False
+        self.generic_visit(node)
+    
+    def visit_If(self, node: ast.If):
+        """Track if conditions for guard context."""
+        # Extract the if condition as a string
+        guard = ast.unparse(node.test) if hasattr(ast, 'unparse') else self._expr_to_str(node.test)
+        old_guard = self._current_if_guard
+        self._current_if_guard = f"if {guard}:"
+        self._in_if_block = True
+        self.generic_visit(node)
+        self._in_if_block = False
+        self._current_if_guard = old_guard
+    
+    def visit_Call(self, node: ast.Call):
+        """Find .explain() calls and m.info() messages."""
+        # Track m.info() calls for context
+        if self._is_m_info(node):
+            msg = self._extract_string_arg(node)
+            if msg:
+                self._info_messages.append((node.lineno, msg))
+        
+        # Find .explain() calls
+        if self._is_explain_call(node):
+            cmd_name = self._get_explain_command(node)
+            kwargs = self._extract_kwargs(node)
+            line_no = node.lineno
+            
+            # Collect preceding m.info messages as context
+            context = []
+            for ln, msg in reversed(self._info_messages):
+                if ln < line_no:
+                    context.append(msg)
+                    if len(context) >= 2:
+                        break
+            
+            self.explain_calls.append({
+                'command': cmd_name,
+                'args': kwargs,
+                'guard': self._current_if_guard if self._in_if_block else "",
+                'message': context[0] if context else "",
+                'line': line_no,
+                'func': getattr(self, '_current_func', 'unknown'),
+            })
+        
+        self.generic_visit(node)
+    
+    def _is_explain_call(self, node: ast.Call) -> bool:
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr == 'explain'
+        if isinstance(node.func, ast.Subscript):
+            # Handle m._commands['name'].explain() - rare case
+            if isinstance(node.func.value, ast.Attribute):
+                return node.func.value.attr == 'explain'
+        return False
+    
+    def _is_m_info(self, node: ast.Call) -> bool:
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr in ('info', 'warn', 'ok')
+        return False
+    
+    def _get_explain_command(self, node: ast.Call) -> str:
+        """Extract command name from .explain() call."""
+        if isinstance(node.func, ast.Attribute):
+            base = node.func.value
+            if isinstance(base, ast.Name):
+                return base.id  # create.explain -> "create"
+            if isinstance(base, ast.Attribute):
+                return base.attr  # m._commands['create'].explain -> "create"
+        elif isinstance(node.func, ast.Subscript):
+            # Handle m._commands['name'].explain() - rare case
+            if isinstance(node.func.value, ast.Attribute):
+                return "??"
+        return "unknown"
+    
+    def _extract_kwargs(self, node: ast.Call) -> dict:
+        """Extract keyword arguments from .explain() call."""
+        kwargs = {}
+        for kw in node.keywords:
+            val = kw.value
+            if isinstance(val, ast.Name):
+                kwargs[kw.arg] = val.id
+            elif isinstance(val, ast.Constant):
+                kwargs[kw.arg] = val.value
+            else:
+                kwargs[kw.arg] = "??"
+        return kwargs
+    
+    def _extract_string_arg(self, node: ast.Call) -> str:
+        """Extract string argument from m.info() call."""
+        if not node.args:
+            return ""
+        val = node.args[0]
+        if isinstance(val, ast.Constant):
+            v = val.value
+            if isinstance(v, str):
+                return v
+        if isinstance(val, ast.Str):
+            return str(val.s)  # type: ignore
+        return ""
+    
+    def _expr_to_str(self, node) -> str:
+        """Fallback for older Python versions."""
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return self._expr_to_str(node.value) + '.' + node.attr
+        return "?"
+
+
+class LearnMode:
+    """Generate command tours by analyzing source code."""
+    
+    def __init__(self, source_file: str):
+        self.source_file = source_file
+        with open(source_file) as f:
+            self.source = f.read()
+            self.source_lines = self.source.split('\n')
+        
+        self.tree = ast.parse(self.source)
+        self.visitor = ExplainVisitor(self.source_lines)
+        self.visitor.visit(self.tree)
+        self.tours = self._build_tours()
+    
+    def _build_tours(self) -> dict[str, CommandTour]:
+        """Build tour info for each command."""
+        tours = {}
+        
+        for cmd_name in _commands:
+            # Get docstring
+            source_func = self._find_function(cmd_name)
+            desc = ""
+            if source_func:
+                doc = ast.get_docstring(source_func)
+                if doc:
+                    desc = doc.split('\n')[0]
+            
+            # Find explain calls from this command
+            steps = []
+            for call in self.visitor.explain_calls:
+                if call['func'] == cmd_name:
+                    steps.append(LearnStep(
+                        command=call['command'],
+                        args=call['args'],
+                        message=call['message'],
+                        line=call['line'],
+                    ))
+            
+            tours[cmd_name] = CommandTour(
+                name=cmd_name,
+                description=desc or _commands[cmd_name].description.split('\n')[0],
+                steps=steps,
+            )
+        
+        return tours
+    
+    def _find_function(self, name: str) -> Optional[ast.FunctionDef]:
+        """Find function definition in AST."""
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node
+        return None
+    
+    def _format_args(self, args: dict) -> str:
+        """Format args for command line, handling booleans specially."""
+        parts = []
+        for k, v in args.items():
+            if v is True:
+                parts.append(f"--{k}")  # Boolean flag
+            elif v is False:
+                pass  # Don't show --no-foo, just omit it
+            else:
+                parts.append(f"--{k} {v}")
+        return " ".join(parts)
+    
+    def show_all(self):
+        """Show overview of all commands with their next steps."""
+        bold = COLORS['bold']
+        nc = COLORS['nc']
+        cyan = COLORS['cyan']
+        
+        script_name = Path(self.source_file).name
+        
+        print(f"""
+{bold}╔══════════════════════════════════════════════════════════════════════════════╗
+║                            COMMAND TOUR: {script_name:<25}║
+║                      Auto-discovered workflows and next steps                ║
+╚══════════════════════════════════════════════════════════════════════════════╝{nc}
+""")
+        
+        for name, tour in sorted(self.tours.items()):
+            print(f"{bold}{name}{nc}")
+            print(f"  {tour.description}")
+            
+            if tour.steps:
+                print(f"  {cyan}Next steps from here:{nc}")
+                for step in tour.steps:
+                    # Reconstruct the command invocation
+                    args_str = self._format_args(step.args)
+                    invocation = f"{step.command} {args_str}".strip()
+                    
+                    if step.message:
+                        print(f"    → {step.message}")
+                    print(f"      {script_name} {invocation}")
+            else:
+                print(f"  (no next steps discovered)")
+            print()
+        
+        print(f"{bold}Run specific command tour:{nc}")
+        print(f"  {script_name} --learn <command>")
+    
+    def show_command(self, cmd_name: str):
+        """Show detailed tour for a specific command."""
+        if cmd_name not in self.tours:
+            fail(f"Unknown command: {cmd_name}")
+        
+        tour = self.tours[cmd_name]
+        bold = COLORS['bold']
+        nc = COLORS['nc']
+        cyan = COLORS['cyan']
+        green = COLORS['green']
+        script_name = Path(self.source_file).name
+        
+        print(f"""
+{bold}╔══════════════════════════════════════════════════════════════════════════════╗
+║                         COMMAND: {cmd_name:<40}║
+╚══════════════════════════════════════════════════════════════════════════════╝{nc}
+
+{bold}Description:{nc}
+  {tour.description}
+
+{bold}Next steps (auto-discovered):{nc}
+""")
+        
+        if not tour.steps:
+            print(f"  (no next steps discovered)")
+        else:
+            for i, step in enumerate(tour.steps, 1):
+                args_str = self._format_args(step.args)
+                invocation = f"{step.command} {args_str}".strip()
+                
+                print(f"  {green}{i}.{nc}")
+                if step.message:
+                    print(f"     {step.message}")
+                if step.guard:
+                    print(f"     {cyan}Condition:{nc} {step.guard}")
+                print(f"     {bold}Run:{nc} {script_name} {invocation}")
+                print()
+
 
 # ============================================================================
 # MARK: Status Helpers
@@ -519,14 +806,22 @@ def main():
         action='store_true',
         help='Print commands without executing'
     )
-
+    
+    parser.add_argument(
+        '--learn',
+        nargs='?',
+        const=True,
+        metavar='COMMAND',
+        help='Show command tour and next steps (--learn or --learn <cmd>)'
+    )
+    
     parser.add_argument(
         '--help', '-h',
         action='help',
         default=argparse.SUPPRESS,
         help='show this help message'
     )
-
+    
     subparsers = parser.add_subparsers(dest='command', metavar='[command]')
 
     # Add command parsers
@@ -578,7 +873,19 @@ def main():
                 )
 
     args = parser.parse_args()
-
+    
+    # Handle --learn mode
+    if args.learn is not None:
+        # Get the actual tool script being run (not microcli.py)
+        import sys as _sys
+        source_file = str(_sys.modules['__main__'].__file__)
+        learn = LearnMode(source_file)
+        if isinstance(args.learn, str):
+            learn.show_command(args.learn)
+        else:
+            learn.show_all()
+        sys.exit(0)
+    
     if args.command is None:
         # No command - show module help
         parser.print_help()
