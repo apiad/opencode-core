@@ -11,12 +11,18 @@ Determine what should be the content of the note (a well-structured markdown bod
 
 ## What to do next
 
-Run the following command:
+Run the following command with appropriate args.
 
 ```bash
-uv run .opencode/bin/note.py --title [TITLE] --slug [SLUG] --tags [TAGS (comma-separated)]
+uv run .opencode/bin/note.py create [...] << 'EOF'
+Note content
+EOF
 ```
 
-Use `cat` or `echo` to send the actual content as stdin if its short, or write to a temporary file if its long.
+**Start here:**
+
+!`uv run .opencode/bin/note.py create -h`
+
+IMPORTANT: Do NOT save the note until the user approves.
 
 **Read the output and follow instructions from there.**

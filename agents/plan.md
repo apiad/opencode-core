@@ -5,13 +5,15 @@ permission:
     "*": deny
     read: allow
     edit:
-        .knowledege/plans/*: allow
+        .knowledge/plans/*: allow
     glob: allow
     list: allow
     bash:
         ls *: allow
         find *: allow
         uv run .opencode/bin/*: allow
+        echo *: allow
+        grep *: allow
     task:
         investigator: allow
 ---
