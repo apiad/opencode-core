@@ -380,11 +380,13 @@ class LearnMode:
                 args_str = self._format_args(step.args)
                 invocation = f"{step.command} {args_str}".strip()
                 
-                print(f"  {green}{i}.{nc}")
+                print(f"  {green}{i}.{nc}", end="")
+                if step.guard:
+                    print(f" {cyan}Condition:{nc} {step.guard}")
+                else:
+                    print()
                 if step.message:
                     print(f"     {step.message}")
-                if step.guard:
-                    print(f"     {cyan}Condition:{nc} {step.guard}")
                 print(f"     {bold}Run:{nc} {script_name} {invocation}")
                 print()
         
@@ -395,9 +397,12 @@ class LearnMode:
             print(f"  (no failure modes discovered)")
         else:
             for i, fail in enumerate(tour.failures, 1):
-                print(f"  {COLORS['red']}{i}. {fail.message}{nc}")
+                print(f"  {COLORS['red']}{i}.{nc}", end="")
                 if fail.guard:
-                    print(f"     {cyan}Condition:{nc} {fail.guard}")
+                    print(f" {cyan}Condition:{nc} {fail.guard}")
+                else:
+                    print()
+                print(f"     {COLORS['red']}{fail.message}{nc}")
                 print()
 
 
