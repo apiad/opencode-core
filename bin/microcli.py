@@ -397,7 +397,7 @@ class LearnMode:
             for i, fail in enumerate(tour.failures, 1):
                 print(f"  {COLORS['red']}{i}. {fail.message}{nc}")
                 if fail.guard:
-                    print(f"     {cyan}When:{nc} {fail.guard}")
+                    print(f"     {cyan}Condition:{nc} {fail.guard}")
                 print()
 
 
