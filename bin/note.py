@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# ///
+
 """note - Create structured notes with YAML frontmatter.
 
 Usage:
-    uv run ///script/note.py create [args...]
-
-Dependencies:
-    uv add microcli
+    uv run note.py create [args...]
 
 Commands:
     create    Create a new note
 """
-# ///script dependencies: uv add microcli
-from typing import Annotated
+from pathlib import Path
 import sys
-import re
+
+# Use local microcli from lib/
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "lib/microcli/src"))
+
 import microcli as m
 from datetime import datetime
-from pathlib import Path
+import re
 
 NOTES_DIR = Path(".knowledge/notes")
 
@@ -46,10 +49,10 @@ def format_note(title: str, slug: str, tags: list, content: str) -> str:
 
 @m.command
 def create(
-    title: Annotated[str, "Note title"],
-    slug: Annotated[str, "URL slug (auto-generated if not provided)"] = "",
-    tags: Annotated[str, "Comma-separated tags"] = "",
-    save: Annotated[bool, "Save to file (default: draft mode)"] = False,
+    title: str,
+    slug: str = "",
+    tags: str = "",
+    save: bool = False,
 ):
     """Create a structured note from stdin content."""
     content = sys.stdin.read().strip()
