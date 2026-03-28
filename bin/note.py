@@ -2,11 +2,15 @@
 """note - Create structured notes with YAML frontmatter.
 
 Usage:
-    python note.py create [args...]
+    uv run ///script/note.py create [args...]
+
+Dependencies:
+    uv add microcli
 
 Commands:
     create    Create a new note
 """
+# ///script dependencies: uv add microcli
 from typing import Annotated
 import sys
 import re
@@ -63,7 +67,11 @@ def create(
     # Format the note
     formatted = format_note(title, slug, tag_list, content)
 
-    if save:
+    if not save:
+        # Draft mode - show how to save
+        m.info("Note is in draft mode. To save, create the exact same note with --save:")
+        m.info(f"  {create.explain(title=title, slug=slug, tags=tags, save=True)}")
+    else:
         NOTES_DIR.mkdir(parents=True, exist_ok=True)
         filepath = NOTES_DIR / f"{slug}.md"
 
@@ -72,10 +80,6 @@ def create(
 
         filepath.write_text(formatted)
         m.ok(f"Saved to: {filepath}")
-    else:
-        # Draft mode - show how to save
-        m.info("Note is in draft mode. To save, create the exact same note with --save:")
-        m.info(f"  {create.explain(title=title, slug=slug, tags=tags, save=True)}")
 
 
 if __name__ == "__main__":
