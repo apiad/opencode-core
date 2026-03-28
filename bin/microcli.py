@@ -55,11 +55,19 @@ class LearnStep:
     line: int = 0
 
 @dataclass
+class FailStep:
+    """A failure mode in the command tour."""
+    message: str
+    guard: str = ""
+    line: int = 0
+
+@dataclass
 class CommandTour:
     """Tour information for a command."""
     name: str
     description: str
     steps: list[LearnStep] = field(default_factory=list)
+    failures: list[FailStep] = field(default_factory=list)
 
 
 class ExplainVisitor(ast.NodeVisitor):
@@ -68,6 +76,7 @@ class ExplainVisitor(ast.NodeVisitor):
     def __init__(self, source_lines: list[str]):
         self.source_lines = source_lines
         self.explain_calls: list[dict] = []
+        self.fail_calls: list[dict] = []
         self._info_messages: list[tuple[int, str]] = []
         self._current_if_guard: str = ""
         self._in_if_block = False
@@ -91,12 +100,22 @@ class ExplainVisitor(ast.NodeVisitor):
         self._current_if_guard = old_guard
     
     def visit_Call(self, node: ast.Call):
-        """Find .explain() calls and m.info() messages."""
+        """Find .explain(), m.info(), and m.fail() calls."""
         # Track m.info() calls for context
         if self._is_m_info(node):
             msg = self._extract_string_arg(node)
             if msg:
                 self._info_messages.append((node.lineno, msg))
+        
+        # Find m.fail() calls (failure modes)
+        if self._is_m_fail(node):
+            msg = self._extract_fail_message(node)
+            self.fail_calls.append({
+                'message': msg,
+                'guard': self._current_if_guard if self._in_if_block else "",
+                'line': node.lineno,
+                'func': getattr(self, '_current_func', 'unknown'),
+            })
         
         # Find .explain() calls
         if self._is_explain_call(node):
@@ -136,6 +155,32 @@ class ExplainVisitor(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute):
             return node.func.attr in ('info', 'warn', 'ok')
         return False
+    
+    def _is_m_fail(self, node: ast.Call) -> bool:
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr == 'fail'
+        return False
+    
+    def _extract_fail_message(self, node: ast.Call) -> str:
+        """Extract message from m.fail() call."""
+        if not node.args:
+            return "Unknown error"
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+        if isinstance(arg, ast.JoinedStr):
+            # f-string - extract static parts
+            parts = []
+            for val in arg.values:
+                if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                    parts.append(val.value)
+                elif isinstance(val, ast.FormattedValue):
+                    parts.append("{" + self._expr_to_str(val.value) + "}")
+            return "".join(parts)
+        if isinstance(arg, ast.BinOp):
+            # Concatenation like "Error: " + var
+            return self._expr_to_str(arg)
+        return "Error (message depends on runtime values)"
     
     def _get_explain_command(self, node: ast.Call) -> str:
         """Extract command name from .explain() call."""
@@ -221,6 +266,17 @@ class LearnMode:
                         command=call['command'],
                         args=call['args'],
                         message=call['message'],
+                        guard=call['guard'],
+                        line=call['line'],
+                    ))
+            
+            # Find fail calls from this command
+            failures = []
+            for call in self.visitor.fail_calls:
+                if call['func'] == cmd_name:
+                    failures.append(FailStep(
+                        message=call['message'],
+                        guard=call['guard'],
                         line=call['line'],
                     ))
             
@@ -228,6 +284,7 @@ class LearnMode:
                 name=cmd_name,
                 description=desc or _commands[cmd_name].description.split('\n')[0],
                 steps=steps,
+                failures=failures,
             )
         
         return tours
@@ -280,8 +337,14 @@ class LearnMode:
                     if step.message:
                         print(f"    → {step.message}")
                     print(f"      {script_name} {invocation}")
-            else:
-                print(f"  (no next steps discovered)")
+            
+            if tour.failures:
+                print(f"  {COLORS['red']}Failure modes:{nc}")
+                for fail in tour.failures:
+                    print(f"    ✗ {fail.message}")
+            
+            if not tour.steps and not tour.failures:
+                print(f"  (no next steps or failure modes discovered)")
             print()
         
         print(f"{bold}Run specific command tour:{nc}")
@@ -323,6 +386,18 @@ class LearnMode:
                 if step.guard:
                     print(f"     {cyan}Condition:{nc} {step.guard}")
                 print(f"     {bold}Run:{nc} {script_name} {invocation}")
+                print()
+        
+        print(f"""{bold}Failure modes:{nc}
+""")
+        
+        if not tour.failures:
+            print(f"  (no failure modes discovered)")
+        else:
+            for i, fail in enumerate(tour.failures, 1):
+                print(f"  {COLORS['red']}{i}. {fail.message}{nc}")
+                if fail.guard:
+                    print(f"     {cyan}When:{nc} {fail.guard}")
                 print()
 
 
