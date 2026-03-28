@@ -62,59 +62,113 @@ class FailStep:
     line: int = 0
 
 @dataclass
+class HappyStep:
+    """A happy path (success) in the command tour."""
+    message: str
+    guard: str = ""
+    line: int = 0
+
+@dataclass
 class CommandTour:
     """Tour information for a command."""
     name: str
     description: str
     steps: list[LearnStep] = field(default_factory=list)
     failures: list[FailStep] = field(default_factory=list)
+    happy_paths: list[HappyStep] = field(default_factory=list)
 
 
 class ExplainVisitor(ast.NodeVisitor):
-    """AST visitor to find .explain() calls and their context."""
+    """AST visitor to find .explain(), m.fail(), and m.ok() calls."""
     
     def __init__(self, source_lines: list[str]):
         self.source_lines = source_lines
         self.explain_calls: list[dict] = []
         self.fail_calls: list[dict] = []
+        self.ok_calls: list[dict] = []
         self._info_messages: list[tuple[int, str]] = []
-        self._current_if_guard: str = ""
-        self._in_if_block = False
+        self._current_func: str = ""
+        self._guard_stack: list[str] = []  # Stack of active conditions
     
     def visit_FunctionDef(self, node: ast.FunctionDef):
         """Track which command function we're in."""
         self._current_func = node.name
         self._info_messages = []
-        self._in_if_block = False
+        self._guard_stack = []
         self.generic_visit(node)
+        self._current_func = ""
+    
+    def _invert_guard(self, guard: str) -> str:
+        """Invert a guard condition."""
+        if guard.startswith("if not "):
+            return "if " + guard[7:]  # if not x -> if x
+        elif guard.startswith("if "):
+            return "if not " + guard[3:]  # if x -> if not x
+        return guard
+    
+    def _is_early_return(self, node) -> bool:
+        """Check if this node is a return statement."""
+        return isinstance(node, ast.Return)
     
     def visit_If(self, node: ast.If):
-        """Track if conditions for guard context."""
-        # Extract the if condition as a string
+        """Track if conditions and their else blocks."""
         guard = ast.unparse(node.test) if hasattr(ast, 'unparse') else self._expr_to_str(node.test)
-        old_guard = self._current_if_guard
-        self._current_if_guard = f"if {guard}:"
-        self._in_if_block = True
-        self.generic_visit(node)
-        self._in_if_block = False
-        self._current_if_guard = old_guard
+        
+        # Push the positive guard
+        self._guard_stack.append(f"if {guard}:")
+        
+        # Check if if-body ends with return (implies else)
+        if_ends_with_return = (len(node.body) > 0 and 
+                               isinstance(node.body[-1], ast.Return))
+        
+        # Visit if body
+        for child in node.body:
+            self.visit(child)
+        
+        # Pop the if guard
+        self._guard_stack.pop()
+        
+        # Visit else body with inverted guard (if exists)
+        if node.orelse:
+            self._guard_stack.append(self._invert_guard(f"if {guard}:"))
+            for child in node.orelse:
+                self.visit(child)
+            self._guard_stack.pop()
+        
+        # Handle implicit else: if ends with return, remaining stmts are in else
+        if if_ends_with_return:
+            # Remaining siblings at parent level are in implicit else
+            pass  # Handled by parent visiting remaining nodes
     
     def visit_Call(self, node: ast.Call):
-        """Find .explain(), m.info(), and m.fail() calls."""
+        """Find .explain(), m.info(), m.fail(), and m.ok() calls."""
         # Track m.info() calls for context
         if self._is_m_info(node):
             msg = self._extract_string_arg(node)
             if msg:
                 self._info_messages.append((node.lineno, msg))
         
+        # Build current guard from stack
+        current_guard = self._guard_stack[-1] if self._guard_stack else ""
+        
         # Find m.fail() calls (failure modes)
         if self._is_m_fail(node):
             msg = self._extract_fail_message(node)
             self.fail_calls.append({
                 'message': msg,
-                'guard': self._current_if_guard if self._in_if_block else "",
+                'guard': current_guard,
                 'line': node.lineno,
-                'func': getattr(self, '_current_func', 'unknown'),
+                'func': self._current_func,
+            })
+        
+        # Find m.ok() calls (happy paths)
+        if self._is_m_ok(node):
+            msg = self._extract_ok_message(node)
+            self.ok_calls.append({
+                'message': msg,
+                'guard': current_guard,
+                'line': node.lineno,
+                'func': self._current_func,
             })
         
         # Find .explain() calls
@@ -134,10 +188,66 @@ class ExplainVisitor(ast.NodeVisitor):
             self.explain_calls.append({
                 'command': cmd_name,
                 'args': kwargs,
-                'guard': self._current_if_guard if self._in_if_block else "",
+                'guard': current_guard,
                 'message': context[0] if context else "",
                 'line': line_no,
-                'func': getattr(self, '_current_func', 'unknown'),
+                'func': self._current_func,
+            })
+        
+        self.generic_visit(node)
+    
+    def visit_Call(self, node: ast.Call):
+        """Find .explain(), m.info(), and m.fail() calls."""
+        # Track m.info() calls for context
+        if self._is_m_info(node):
+            msg = self._extract_string_arg(node)
+            if msg:
+                self._info_messages.append((node.lineno, msg))
+        
+        # Build current guard from stack
+        current_guard = self._guard_stack[-1] if self._guard_stack else ""
+        
+        # Find m.fail() calls (failure modes)
+        if self._is_m_fail(node):
+            msg = self._extract_fail_message(node)
+            self.fail_calls.append({
+                'message': msg,
+                'guard': current_guard,
+                'line': node.lineno,
+                'func': self._current_func,
+            })
+        
+        # Find m.ok() calls (happy paths)
+        if self._is_m_ok(node):
+            msg = self._extract_ok_message(node)
+            self.ok_calls.append({
+                'message': msg,
+                'guard': current_guard,
+                'line': node.lineno,
+                'func': self._current_func,
+            })
+        
+        # Find .explain() calls
+        if self._is_explain_call(node):
+            cmd_name = self._get_explain_command(node)
+            kwargs = self._extract_kwargs(node)
+            line_no = node.lineno
+            
+            # Collect preceding m.info messages as context
+            context = []
+            for ln, msg in reversed(self._info_messages):
+                if ln < line_no:
+                    context.append(msg)
+                    if len(context) >= 2:
+                        break
+            
+            self.explain_calls.append({
+                'command': cmd_name,
+                'args': kwargs,
+                'guard': current_guard,
+                'message': context[0] if context else "",
+                'line': line_no,
+                'func': self._current_func,
             })
         
         self.generic_visit(node)
@@ -160,6 +270,31 @@ class ExplainVisitor(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute):
             return node.func.attr == 'fail'
         return False
+    
+    def _is_m_ok(self, node: ast.Call) -> bool:
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr == 'ok'
+        return False
+    
+    def _extract_ok_message(self, node: ast.Call) -> str:
+        """Extract message from m.ok() call."""
+        if not node.args:
+            return "Success"
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+        if isinstance(arg, ast.JoinedStr):
+            # f-string - extract static parts
+            parts = []
+            for val in arg.values:
+                if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                    parts.append(val.value)
+                elif isinstance(val, ast.FormattedValue):
+                    parts.append("{" + self._expr_to_str(val.value) + "}")
+            return "".join(parts)
+        if isinstance(arg, ast.BinOp):
+            return self._expr_to_str(arg)
+        return "Success (message depends on runtime values)"
     
     def _extract_fail_message(self, node: ast.Call) -> str:
         """Extract message from m.fail() call."""
@@ -280,11 +415,22 @@ class LearnMode:
                         line=call['line'],
                     ))
             
+            # Find ok calls (happy paths) from this command
+            happy_paths = []
+            for call in self.visitor.ok_calls:
+                if call['func'] == cmd_name:
+                    happy_paths.append(HappyStep(
+                        message=call['message'],
+                        guard=call['guard'],
+                        line=call['line'],
+                    ))
+            
             tours[cmd_name] = CommandTour(
                 name=cmd_name,
                 description=desc or _commands[cmd_name].description.split('\n')[0],
                 steps=steps,
                 failures=failures,
+                happy_paths=happy_paths,
             )
         
         return tours
@@ -403,6 +549,21 @@ class LearnMode:
                 else:
                     print()
                 print(f"     {COLORS['red']}{fail.message}{nc}")
+                print()
+        
+        print(f"""{bold}Happy paths:{nc}
+""")
+        
+        if not tour.happy_paths:
+            print(f"  (no happy paths discovered)")
+        else:
+            for i, happy in enumerate(tour.happy_paths, 1):
+                print(f"  {green}{i}.{nc}", end="")
+                if happy.guard:
+                    print(f" {cyan}Condition:{nc} {happy.guard}")
+                else:
+                    print()
+                print(f"     {happy.message}")
                 print()
 
 
