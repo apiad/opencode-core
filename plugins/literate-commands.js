@@ -103,7 +103,7 @@ function parseStep(section) {
     if (configMatch) {
         // Simple YAML parsing for config
         const configText = configMatch[1]
-        config = parseSimpleYaml(configText)
+        config = parseNestedYaml(configText)
         remaining = section.replace(configMatch[0], "").trim()
     }
 
@@ -127,8 +127,8 @@ function parseStep(section) {
 }
 
 /**
- * Simple YAML parser for flat key-value pairs.
- * Handles: key: value, key: "quoted value", key: [a, b, c]
+ * Simple YAML parser for nested key-value pairs.
+ * Handles: key: value, nested.key: value, key: "quoted value", key: [a, b, c]
  */
 function parseSimpleYaml(text) {
     const result = {}
@@ -168,6 +168,69 @@ function parseSimpleYaml(text) {
     }
 
     return result
+}
+
+/**
+ * Parse nested YAML config (handles parse:, question:, match: blocks).
+ * Extracts top-level keys and nested content.
+ */
+function parseNestedYaml(text) {
+    const result = {}
+    const lines = text.split("\n")
+    let currentKey = null
+    let currentNested = null
+    let indentLevel = 0
+
+    for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed || trimmed.startsWith("#")) continue
+
+        // Check for top-level key (no indent)
+        const topMatch = trimmed.match(/^(\w+)\s*:\s*(.*)$/)
+        if (topMatch && !line.startsWith(" ") && !line.startsWith("\t")) {
+            currentKey = topMatch[1]
+            const value = topMatch[2]
+
+            if (value === "" || value === "~") {
+                // This key has nested content
+                result[currentKey] = {}
+                currentNested = result[currentKey]
+                indentLevel = 0
+            } else {
+                // Simple value
+                result[currentKey] = parseValue(value)
+                currentNested = null
+            }
+        } else if (currentNested !== null) {
+            // We're in a nested block
+            const nestedMatch = trimmed.match(/^(\w+\??)\s*:\s*(.*)$/)
+            if (nestedMatch) {
+                const [nestedKey, nestedValue] = nestedMatch.slice(1)
+                currentNested[nestedKey] = parseValue(nestedValue)
+            }
+        }
+    }
+
+    return result
+}
+
+function parseValue(value) {
+    if (value.startsWith("[") && value.endsWith("]")) {
+        return value.slice(1, -1).split(",").map(s => s.trim())
+    } else if (value.startsWith('"') && value.endsWith('"')) {
+        return value.slice(1, -1)
+    } else if (value.startsWith("'") && value.endsWith("'")) {
+        return value.slice(1, -1)
+    } else if (value === "true") {
+        return true
+    } else if (value === "false") {
+        return false
+    } else if (value === "" || value === "~" || value === "null") {
+        return null
+    } else if (!isNaN(value) && value.trim() !== "") {
+        return Number(value)
+    }
+    return value.trim()
 }
 
 /**
@@ -548,6 +611,15 @@ export default async function literateCommandsPlugin({ client, $ }) {
                 }
             })
 
+            // Test parse functionality with mock response
+            await log(client, `[literate-commands] Step config: ${JSON.stringify(step.config)}`)
+            if (step.config.parse) {
+                const mockResponse = `Here is the information:\n\`\`\`json\n{"topic": "testing", "count": 42}\n\`\`\``
+                await log(client, `[literate-commands] Testing parse with mock response`)
+                processParse(step, mockResponse, state.metadata, client)
+                await log(client, `[literate-commands] Metadata after parse: ${JSON.stringify(state.metadata)}`)
+            }
+
             // Advance to next step
             await log(client, `[literate-commands] Advancing from step ${stepIndex} to ${stepIndex + 1}`)
             state.currentStep++
@@ -627,6 +699,26 @@ Step 2`
     assert(interpolate("All: $$", meta).includes('"name":"Alice"'), "interpolate $$ includes metadata")
     assertEqual(interpolate("Raw $missing", meta), "Raw null", "interpolate missing")
     console.log("✓ interpolate")
+
+    // Test: parseNestedYaml
+    const nestedYaml1 = `step: ask-info
+parse:
+    topic: "What is the topic?"
+    count: "What is the count?"`
+    const nestedResult1 = parseNestedYaml(nestedYaml1)
+    assertEqual(nestedResult1.step, "ask-info", "parseNestedYaml step")
+    assertEqual(nestedResult1.parse.topic, "What is the topic?", "parseNestedYaml nested topic")
+    assertEqual(nestedResult1.parse.count, "What is the count?", "parseNestedYaml nested count")
+    console.log("✓ parseNestedYaml")
+
+    // Test: parseNestedYaml with boolean key
+    const nestedYaml2 = `parse:
+    done?: "Is it done?"
+    ok: next`
+    const nestedResult2 = parseNestedYaml(nestedYaml2)
+    assertEqual(nestedResult2.parse["done?"], "Is it done?", "parseNestedYaml boolean key")
+    assertEqual(nestedResult2.parse.ok, "next", "parseNestedYaml regular key")
+    console.log("✓ parseNestedYaml boolean key")
 
     // Test: parseResponse with JSON
     const jsonResponse = '```json\n{"topic": "AI", "count": 42}\n```'
