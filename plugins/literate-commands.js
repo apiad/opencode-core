@@ -329,7 +329,6 @@ async function runScript(block, metadata, $) {
  */
 async function processScripts(step, metadata, $) {
     let resultPrompt = step.prompt
-    console.log("[DEBUG] Initial prompt:\n", resultPrompt)
 
     for (const block of step.codeBlocks) {
         if (!block.meta.includes("exec")) continue
@@ -339,24 +338,116 @@ async function processScripts(step, metadata, $) {
         // Update metadata if store mode
         if (stored) {
             Object.assign(metadata, stored)
-            console.log("[DEBUG] Stored metadata:", stored)
         }
 
         // Replace block in prompt with output (for stdout mode)
         if (output) {
-            const blockPattern = `\`\`\`${block.language}\\s*\\{[^}]+\\}\\n[\\s\\S]*?\`\`\``
-            console.log("[DEBUG] Block pattern:", blockPattern)
-            console.log("[DEBUG] Before replace, checking match:", resultPrompt.match(new RegExp(blockPattern)) !== null)
+            const blockPattern = `\`\`\`${block.language}\\s*\{[^}]+\}\n[\s\S]*?\`\`\``
             resultPrompt = resultPrompt.replace(new RegExp(blockPattern), output)
         } else {
             // Remove block if no output
-            const blockPattern = `\`\`\`${block.language}\\s*\\{[^}]+\\}\\n[\\s\\S]*?\`\`\``
+            const blockPattern = `\`\`\`${block.language}\\s*\{[^}]+\}\n[\s\S]*?\`\`\``
             resultPrompt = resultPrompt.replace(new RegExp(blockPattern), "")
         }
     }
 
-    console.log("[DEBUG] Final prompt:\n", resultPrompt)
     return resultPrompt
+}
+
+// ============================================================================
+// Parse Functionality
+// ============================================================================
+
+/**
+ * Parse variables from model response based on step config.
+ * 
+ * Config example:
+ *   parse:
+ *     topic: "What is the topic?"
+ *     count: "How many items?"
+ *     done?: "Is this done?"  (boolean - ends with ?)
+ * 
+ * Response parsing:
+ * - Try to find ```json...``` block first
+ * - Otherwise extract from plain text
+ * - Boolean vars (ending in ?) must be true/false
+ */
+function parseResponse(responseText, parseConfig) {
+    const result = {}
+    
+    // First, try to find JSON in the response
+    const jsonMatch = responseText.match(/```json\n([\s\S]*?)\n```/)
+    if (jsonMatch) {
+        try {
+            const parsed = JSON.parse(jsonMatch[1])
+            for (const [key, value] of Object.entries(parseConfig)) {
+                const isBool = key.endsWith("?")
+                const actualKey = isBool ? key.slice(0, -1) : key
+                
+                if (parsed[actualKey] !== undefined) {
+                    if (isBool) {
+                        result[key] = Boolean(parsed[actualKey])
+                    } else {
+                        result[key] = String(parsed[actualKey])
+                    }
+                }
+            }
+            return result
+        } catch (e) {
+            // JSON parse failed, continue to text parsing
+        }
+    }
+    
+    // Text-based extraction
+    for (const [key, prompt] of Object.entries(parseConfig)) {
+        const isBool = key.endsWith("?")
+        const actualKey = isBool ? key.slice(0, -1) : key
+        
+        // For booleans, look for "true" or "false" near the prompt
+        if (isBool) {
+            const trueMatch = responseText.toLowerCase().match(/\btrue\b/)
+            const falseMatch = responseText.toLowerCase().match(/\bfalse\b/)
+            if (trueMatch && !falseMatch) {
+                result[key] = true
+            } else if (falseMatch && !trueMatch) {
+                result[key] = false
+            } else if (trueMatch && falseMatch) {
+                // Take the last one
+                result[key] = responseText.lastIndexOf("true") > responseText.lastIndexOf("false")
+            }
+        } else {
+            // For strings, try to find patterns like "topic: value" or "topic is X"
+            const colonMatch = responseText.match(new RegExp(`${actualKey}\\s*:\\s*([^\\n,]+)`, 'i'))
+            if (colonMatch) {
+                result[key] = colonMatch[1].trim()
+            } else {
+                const isMatch = responseText.match(new RegExp(`${actualKey}\\s+(?:is|was)\\s+([^\\n,]+)`, 'i'))
+                if (isMatch) {
+                    result[key] = isMatch[1].trim()
+                }
+            }
+        }
+    }
+    
+    return result
+}
+
+/**
+ * Process parse config from step and extract variables.
+ * Called after model responds.
+ */
+function processParse(step, responseText, metadata, client) {
+    if (!step.config.parse) {
+        return metadata
+    }
+    
+    const parsed = parseResponse(responseText, step.config.parse)
+    log(client, `[literate-commands] Parsed variables: ${JSON.stringify(parsed)}`)
+    
+    // Merge into metadata
+    Object.assign(metadata, parsed)
+    
+    return metadata
 }
 
 export default async function literateCommandsPlugin({ client, $ }) {
@@ -536,6 +627,29 @@ Step 2`
     assert(interpolate("All: $$", meta).includes('"name":"Alice"'), "interpolate $$ includes metadata")
     assertEqual(interpolate("Raw $missing", meta), "Raw null", "interpolate missing")
     console.log("✓ interpolate")
+
+    // Test: parseResponse with JSON
+    const jsonResponse = '```json\n{"topic": "AI", "count": 42}\n```'
+    const parseConfig1 = { topic: "What is the topic?", count: "How many?" }
+    const parsed1 = parseResponse(jsonResponse, parseConfig1)
+    assertEqual(parsed1.topic, "AI", "parseResponse JSON topic")
+    assertEqual(parsed1.count, "42", "parseResponse JSON count")
+    console.log("✓ parseResponse JSON")
+
+    // Test: parseResponse with boolean
+    const boolResponse = "The task is complete. true"
+    const parseConfig2 = { "done?": "Is it done?" }
+    const parsed2 = parseResponse(boolResponse, parseConfig2)
+    assertEqual(parsed2["done?"], true, "parseResponse boolean true")
+    console.log("✓ parseResponse boolean")
+
+    // Test: parseResponse plain text
+    const textResponse = "Topic: Machine Learning\nCount: 10"
+    const parseConfig3 = { topic: "What is the topic?", count: "What is the count?" }
+    const parsed3 = parseResponse(textResponse, parseConfig3)
+    assertEqual(parsed3.topic, "Machine Learning", "parseResponse text topic")
+    assertEqual(parsed3.count, "10", "parseResponse text count")
+    console.log("✓ parseResponse text")
 
     console.log("\n✅ All tests passed!")
 }
