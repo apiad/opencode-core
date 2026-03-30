@@ -110,10 +110,11 @@ function parseStep(section) {
     // Extract code blocks with metadata
     const codeBlocks = parseCodeBlocks(remaining)
 
-    // Remove code blocks from remaining to get prompt
-    const blockRemovalRegex = /```\w+\s*\{[^}]+\}\n[\s\S]*?```/g
+    // Remove {exec} code blocks from prompt (not regular code blocks like ```json)
+    // Only remove blocks that have "exec" in their metadata
+    const execBlockRegex = /```\w+\s*\{[^}]*exec[^}]*\}[^`]*(?:```|$)/g
     const prompt = remaining
-        .replace(blockRemovalRegex, "\n")
+        .replace(execBlockRegex, "\n")
         .split("\n")
         .map(l => l.trim())
         .filter(l => l)
@@ -719,6 +720,25 @@ parse:
     assertEqual(nestedResult2.parse["done?"], "Is it done?", "parseNestedYaml boolean key")
     assertEqual(nestedResult2.parse.ok, "next", "parseNestedYaml regular key")
     console.log("✓ parseNestedYaml boolean key")
+
+    // Test: parseStep preserves non-exec code blocks
+    const stepWithJson = `\`\`\`yaml {config}
+step: test
+\`\`\`
+Here is JSON:
+\`\`\`json
+{"topic": "test"}
+\`\`\`
+And exec:
+\`\`\`bash {exec}
+echo hi
+\`\`\`
+Done.`
+    const parsedStep = parseStep(stepWithJson)
+    assertEqual(parsedStep.codeBlocks.length, 2, "parseStep finds both blocks")
+    assert(parsedStep.prompt.includes('```json'), "parseStep preserves json block")
+    assert(!parsedStep.prompt.includes('echo hi'), "parseStep removes exec block")
+    console.log("✓ parseStep preserves non-exec blocks")
 
     // Test: parseResponse with JSON
     const jsonResponse = '```json\n{"topic": "AI", "count": 42}\n```'
