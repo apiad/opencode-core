@@ -1,17 +1,10 @@
 ---
-description: Test literate commands plugin
+description: Test script execution in step 0
 agent: analyze
 literate: true
 ---
 
-Step 1: This is the first step. Args: $ARGUMENTS
-
----
-
-```yaml {config}
-step: script-test
-```
-Testing script execution:
+Script test in step 0:
 
 ```bash {exec}
 echo "hello from bash"
@@ -22,6 +15,10 @@ print(json.dumps({"topic": "testing", "count": 42}))
 ```
 
 The script returned: topic="$topic", count=$count
+
+---
+
+Step 2: This is the second step.
 
 ---
 

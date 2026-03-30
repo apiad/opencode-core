@@ -33,13 +33,18 @@ const COMMANDS_DIR = ".opencode/commands"
 const sessionStates = new Map()
 
 async function log(client, msg) {
-    await client.app.log({
-        body: {
-            service: "literate-commands",
-            level: "info",
-            message: msg
-        }
-    })
+    if (!client) return
+    try {
+        await client.app.log({
+            body: {
+                service: "literate-commands",
+                level: "info",
+                message: msg
+            }
+        })
+    } catch (e) {
+        console.error("[literate-commands] Log error:", e.message)
+    }
 }
 
 // Simple YAML check for literate: true
@@ -106,9 +111,13 @@ function parseStep(section) {
     const codeBlocks = parseCodeBlocks(remaining)
 
     // Remove code blocks from remaining to get prompt
+    const blockRemovalRegex = /```\w+\s*\{[^}]+\}\n[\s\S]*?```/g
     const prompt = remaining
-        .replace(/```\w+\s*\{[^}]+\}\n[\s\S]*?```/g, "")
-        .trim()
+        .replace(blockRemovalRegex, "\n")
+        .split("\n")
+        .map(l => l.trim())
+        .filter(l => l)
+        .join("\n")
 
     if (!prompt && codeBlocks.length === 0) {
         return null
@@ -227,12 +236,13 @@ const DEFAULT_TIMEOUT = 30000
 
 /**
  * Parse exec block metadata.
- * {exec} → { interpreter: 'python3', mode: 'stdout' }
+ * {exec} → { interpreter: based on language, mode: 'stdout' }
  * {exec=python3} → { interpreter: 'python3', mode: 'stdout' }
- * {exec mode=store} → { interpreter: 'python3', mode: 'store' }
+ * {exec mode=store} → { interpreter: based on language, mode: 'store' }
  */
-function parseExecMeta(meta) {
-    let interpreter = "python3"
+function parseExecMeta(meta, language) {
+    // Default interpreter based on language
+    let interpreter = INTERPRETERS[language] || language
     let mode = "stdout"
 
     for (const item of meta) {
@@ -240,9 +250,8 @@ function parseExecMeta(meta) {
             interpreter = item.replace("exec=", "")
         } else if (item.startsWith("mode=")) {
             mode = item.replace("mode=", "")
-        } else if (item === "exec") {
-            // Default, keep interpreter as python3
         }
+        // "exec" without = is a marker, ignore it
     }
 
     return { interpreter, mode }
@@ -253,7 +262,7 @@ function parseExecMeta(meta) {
  */
 async function runScript(block, metadata, $) {
     const { language, code, meta } = block
-    const { interpreter: interp, mode } = parseExecMeta(meta)
+    const { interpreter: interp, mode } = parseExecMeta(meta, language)
 
     // Get actual interpreter command
     const cmd = INTERPRETERS[interp] || interp
@@ -273,7 +282,7 @@ async function runScript(block, metadata, $) {
         execCmd = `${cmd} -c '${substitutedCode.replace(/'/g, "'\\''")}'`
     }
 
-    await log(null, `[literate-commands] Running: ${execCmd}`)
+    await log(null, `[literate-commands] Running script`)
 
     // Execute via docker or locally
     const useDocker = process.env.LITERATE_DOCKER === "true"
@@ -287,8 +296,9 @@ async function runScript(block, metadata, $) {
     }
 
     try {
-        const result = await $`${fullCmd}`.timeout(DEFAULT_TIMEOUT)
-        const output = result.stdout.trim()
+        // Use execSync for reliable execution
+        const { execSync } = require("child_process")
+        const output = execSync(fullCmd, { encoding: "utf8" }).trim()
 
         if (mode === "stdout") {
             return { output, stored: null }
@@ -319,6 +329,7 @@ async function runScript(block, metadata, $) {
  */
 async function processScripts(step, metadata, $) {
     let resultPrompt = step.prompt
+    console.log("[DEBUG] Initial prompt:\n", resultPrompt)
 
     for (const block of step.codeBlocks) {
         if (!block.meta.includes("exec")) continue
@@ -328,11 +339,14 @@ async function processScripts(step, metadata, $) {
         // Update metadata if store mode
         if (stored) {
             Object.assign(metadata, stored)
+            console.log("[DEBUG] Stored metadata:", stored)
         }
 
         // Replace block in prompt with output (for stdout mode)
         if (output) {
             const blockPattern = `\`\`\`${block.language}\\s*\\{[^}]+\\}\\n[\\s\\S]*?\`\`\``
+            console.log("[DEBUG] Block pattern:", blockPattern)
+            console.log("[DEBUG] Before replace, checking match:", resultPrompt.match(new RegExp(blockPattern)) !== null)
             resultPrompt = resultPrompt.replace(new RegExp(blockPattern), output)
         } else {
             // Remove block if no output
@@ -341,6 +355,7 @@ async function processScripts(step, metadata, $) {
         }
     }
 
+    console.log("[DEBUG] Final prompt:\n", resultPrompt)
     return resultPrompt
 }
 
@@ -500,10 +515,10 @@ Step 2`
     console.log("✓ parseLiterateMarkdown")
 
     // Test: parseExecMeta
-    assertEqual(parseExecMeta(["exec"]).interpreter, "python3", "parseExecMeta default")
-    assertEqual(parseExecMeta(["exec=bash"]).interpreter, "bash", "parseExecMeta custom interpreter")
-    assertEqual(parseExecMeta(["exec", "mode=store"]).mode, "store", "parseExecMeta mode")
-    assertEqual(parseExecMeta(["exec=uv", "run", "python"]).interpreter, "uv", "parseExecMeta exec=uv")
+    assertEqual(parseExecMeta(["exec"], "python").interpreter, "python3", "parseExecMeta default python")
+    assertEqual(parseExecMeta(["exec"], "bash").interpreter, "bash", "parseExecMeta default bash")
+    assertEqual(parseExecMeta(["exec=uv", "run", "python"], "python").interpreter, "uv", "parseExecMeta custom interpreter")
+    assertEqual(parseExecMeta(["exec", "mode=store"], "python").mode, "store", "parseExecMeta mode")
     console.log("✓ parseExecMeta")
 
     // Test: getNestedValue
