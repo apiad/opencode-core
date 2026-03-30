@@ -8,7 +8,20 @@ Step 1: This is the first step. Args: $ARGUMENTS
 
 ---
 
-Step 2: The arguments were "$ARGUMENTS".
+```yaml {config}
+step: script-test
+```
+Testing script execution:
+
+```bash {exec}
+echo "hello from bash"
+```
+```python {exec mode=store}
+import json
+print(json.dumps({"topic": "testing", "count": 42}))
+```
+
+The script returned: topic="$topic", count=$count
 
 ---
 

@@ -2,6 +2,26 @@
  * Literate Commands Plugin
  *
  * Enables step-by-step command execution from markdown.
+ *
+ * TESTING:
+ *
+ * Unit tests (parsing, interpolation):
+ *   node .opencode/plugins/literate-commands.js
+ *
+ * Plugin integration (single command, no step advancement):
+ *   opencode run --print-logs --log-level DEBUG --command test
+ *
+ *   Note: With `opencode run`, the session exits after the first idle,
+ *   so only step 0 is injected. The acknowledgment works, and you can
+ *   verify parsing, script execution, and variable interpolation from logs.
+ *
+ * Full step-through with SDK:
+ *   // Start server, create session, run command, then prompt in a loop
+ *   // See SDK docs: https://opencode.ai/docs/sdk
+ *
+ * Manual full test:
+ *   opencode serve --print-logs --log-level DEBUG &
+ *   opencode run --print-logs --log-level DEBUG --command test --attach http://localhost:PORT
  */
 
 import { readFileSync, existsSync } from "fs"
@@ -190,7 +210,141 @@ function interpolate(text, metadata) {
     })
 }
 
-export default async function literateCommandsPlugin({ client }) {
+// ============================================================================
+// Script Execution
+// ============================================================================
+
+const INTERPRETERS = {
+    python: "python3",
+    python3: "python3",
+    bash: "bash",
+    sh: "sh",
+    javascript: "node",
+    js: "node"
+}
+
+const DEFAULT_TIMEOUT = 30000
+
+/**
+ * Parse exec block metadata.
+ * {exec} → { interpreter: 'python3', mode: 'stdout' }
+ * {exec=python3} → { interpreter: 'python3', mode: 'stdout' }
+ * {exec mode=store} → { interpreter: 'python3', mode: 'store' }
+ */
+function parseExecMeta(meta) {
+    let interpreter = "python3"
+    let mode = "stdout"
+
+    for (const item of meta) {
+        if (item.startsWith("exec=")) {
+            interpreter = item.replace("exec=", "")
+        } else if (item.startsWith("mode=")) {
+            mode = item.replace("mode=", "")
+        } else if (item === "exec") {
+            // Default, keep interpreter as python3
+        }
+    }
+
+    return { interpreter, mode }
+}
+
+/**
+ * Execute a script with variable substitution.
+ */
+async function runScript(block, metadata, $) {
+    const { language, code, meta } = block
+    const { interpreter: interp, mode } = parseExecMeta(meta)
+
+    // Get actual interpreter command
+    const cmd = INTERPRETERS[interp] || interp
+
+    // Substitute variables in code
+    const substitutedCode = interpolate(code, metadata)
+
+    // Build execution command
+    let execCmd
+    if (cmd === "bash" || cmd === "sh") {
+        execCmd = `${cmd} -c '${substitutedCode.replace(/'/g, "'\\''")}'`
+    } else if (cmd === "python3" || cmd === "python") {
+        execCmd = `${cmd} -c '${substitutedCode.replace(/'/g, "'\\''")}'`
+    } else if (cmd === "node") {
+        execCmd = `${cmd} -e '${substitutedCode.replace(/'/g, "'\\''")}'`
+    } else {
+        execCmd = `${cmd} -c '${substitutedCode.replace(/'/g, "'\\''")}'`
+    }
+
+    await log(null, `[literate-commands] Running: ${execCmd}`)
+
+    // Execute via docker or locally
+    const useDocker = process.env.LITERATE_DOCKER === "true"
+    let fullCmd
+
+    if (useDocker) {
+        const image = process.env.LITERATE_DOCKER_IMAGE || "python:3.11"
+        fullCmd = `docker run --rm ${image} ${execCmd}`
+    } else {
+        fullCmd = execCmd
+    }
+
+    try {
+        const result = await $`${fullCmd}`.timeout(DEFAULT_TIMEOUT)
+        const output = result.stdout.trim()
+
+        if (mode === "stdout") {
+            return { output, stored: null }
+        } else if (mode === "store") {
+            try {
+                const parsed = JSON.parse(output)
+                if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+                    await log(null, `[literate-commands] Store mode requires object, got ${typeof parsed}`)
+                    return { output: "", stored: null }
+                }
+                return { output: "", stored: parsed }
+            } catch (e) {
+                await log(null, `[literate-commands] JSON parse failed: ${output}`)
+                return { output: "", stored: null }
+            }
+        } else {
+            // mode === "none"
+            return { output: "", stored: null }
+        }
+    } catch (e) {
+        await log(null, `[literate-commands] Script error: ${e.message}`)
+        return { output: `Script error: ${e.message}`, stored: null }
+    }
+}
+
+/**
+ * Process all {exec} blocks in a step.
+ */
+async function processScripts(step, metadata, $) {
+    let resultPrompt = step.prompt
+
+    for (const block of step.codeBlocks) {
+        if (!block.meta.includes("exec")) continue
+
+        const { output, stored } = await runScript(block, metadata, $)
+
+        // Update metadata if store mode
+        if (stored) {
+            Object.assign(metadata, stored)
+        }
+
+        // Replace block in prompt with output (for stdout mode)
+        if (output) {
+            const blockPattern = `\`\`\`${block.language}\\s*\\{[^}]+\\}\\n[\\s\\S]*?\`\`\``
+            resultPrompt = resultPrompt.replace(new RegExp(blockPattern), output)
+        } else {
+            // Remove block if no output
+            const blockPattern = `\`\`\`${block.language}\\s*\\{[^}]+\\}\\n[\\s\\S]*?\`\`\``
+            resultPrompt = resultPrompt.replace(new RegExp(blockPattern), "")
+        }
+    }
+
+    return resultPrompt
+}
+
+export default async function literateCommandsPlugin({ client, $ }) {
     await log(client, "[literate-commands] Plugin initialized")
 
     return {
@@ -224,8 +378,9 @@ export default async function literateCommandsPlugin({ client }) {
             await log(client, `[literate-commands] Parsed ${steps.length} steps`)
 
             // Log each step for debugging
+            await log(client, `[literate-commands] Parsed ${steps.length} steps:`)
             for (let i = 0; i < steps.length; i++) {
-                await log(client, `[literate-commands] Step ${i}: ${steps[i].config.step}`)
+                await log(client, `[literate-commands]   Step ${i}: "${steps[i].prompt.slice(0, 50)}..."`)
             }
 
             // Set up state for this session
@@ -236,6 +391,7 @@ export default async function literateCommandsPlugin({ client }) {
                 sessionID,
                 commandName: command
             })
+            await log(client, `[literate-commands] State set for session ${sessionID}`)
 
             // Inject acknowledgment
             output.parts.length = 1;
@@ -252,20 +408,30 @@ export default async function literateCommandsPlugin({ client }) {
             if (!sessionID) return
 
             const state = sessionStates.get(sessionID)
-            if (!state) return
+            if (!state) {
+                await log(client, `[literate-commands] No state for session ${sessionID}`)
+                return
+            }
 
             await log(client, `[literate-commands] session.idle for ${sessionID}, step ${state.currentStep}`)
 
             // Get current step
-            const step = state.steps[state.currentStep]
+            const stepIndex = state.currentStep
+            const step = state.steps[stepIndex]
             if (!step) {
-                await log(client, `[literate-commands] No more steps, done`)
+                await log(client, `[literate-commands] No more steps (${stepIndex} >= ${state.steps.length}), done`)
                 sessionStates.delete(sessionID)
                 return
             }
 
-            // Interpolate variables in prompt
-            const interpolatedPrompt = interpolate(step.prompt, state.metadata)
+            await log(client, `[literate-commands] Processing step ${stepIndex}: "${step.prompt.slice(0, 50)}..."`)
+            await log(client, `[literate-commands] Code blocks: ${step.codeBlocks.length}`)
+
+            // Process scripts (with variable substitution) and get modified prompt
+            const processedPrompt = await processScripts(step, state.metadata, $)
+
+            // Interpolate remaining variables in prompt
+            const interpolatedPrompt = interpolate(processedPrompt, state.metadata)
             await log(client, `[literate-commands] Injecting step ${state.currentStep}: ${interpolatedPrompt}`)
 
             // Inject step prompt
@@ -277,7 +443,89 @@ export default async function literateCommandsPlugin({ client }) {
             })
 
             // Advance to next step
+            await log(client, `[literate-commands] Advancing from step ${stepIndex} to ${stepIndex + 1}`)
             state.currentStep++
         }
     }
+}
+
+// ============================================================================
+// Tests (run with: node --test literate-commands.js)
+// ============================================================================
+
+function assert(condition, message) {
+    if (!condition) throw new Error(`FAIL: ${message}`)
+}
+
+function assertEqual(actual, expected, message) {
+    if (actual !== expected) {
+        throw new Error(`FAIL: ${message}\n  Expected: ${JSON.stringify(expected)}\n  Actual: ${JSON.stringify(actual)}`)
+    }
+}
+
+function runTests() {
+    console.log("Running literate-commands tests...\n")
+
+    // Test: hasLiterateFrontmatter
+    assert(hasLiterateFrontmatter("---\nliterate: true\n---\n"), "hasLiterateFrontmatter should detect literate: true")
+    assert(!hasLiterateFrontmatter("---\nliterate: false\n---\n"), "hasLiterateFrontmatter should not detect false")
+    assert(!hasLiterateFrontmatter("No frontmatter"), "hasLiterateFrontmatter should return false without frontmatter")
+    console.log("✓ hasLiterateFrontmatter")
+
+    // Test: parseSimpleYaml
+    assertEqual(parseSimpleYaml("key: value").key, "value", "parseSimpleYaml basic")
+    assertEqual(parseSimpleYaml('key: "quoted"').key, "quoted", "parseSimpleYaml double quotes")
+    assertEqual(parseSimpleYaml("key: 123").key, 123, "parseSimpleYaml number")
+    assertEqual(parseSimpleYaml("key: true").key, true, "parseSimpleYaml boolean")
+    assertEqual(parseSimpleYaml("key: [a, b]").key[0], "a", "parseSimpleYaml array")
+    console.log("✓ parseSimpleYaml")
+
+    // Test: parseCodeBlocks
+    const blocks = parseCodeBlocks('```bash {exec}\necho hi\n```\n```python {exec mode=store}\nprint(1)\n```')
+    assertEqual(blocks.length, 2, "parseCodeBlocks should find 2 blocks")
+    assertEqual(blocks[0].language, "bash", "parseCodeBlocks language")
+    assert(blocks[0].meta.includes("exec"), "parseCodeBlocks should have exec in meta")
+    assertEqual(blocks[1].meta[1], "mode=store", "parseCodeBlocks mode")
+    console.log("✓ parseCodeBlocks")
+
+    // Test: parseLiterateMarkdown
+    const markdown = `---
+description: test
+---
+Step 1
+---
+Step 2`
+    const steps = parseLiterateMarkdown(markdown)
+    assertEqual(steps.length, 2, "parseLiterateMarkdown should find 2 steps")
+    console.log("✓ parseLiterateMarkdown")
+
+    // Test: parseExecMeta
+    assertEqual(parseExecMeta(["exec"]).interpreter, "python3", "parseExecMeta default")
+    assertEqual(parseExecMeta(["exec=bash"]).interpreter, "bash", "parseExecMeta custom interpreter")
+    assertEqual(parseExecMeta(["exec", "mode=store"]).mode, "store", "parseExecMeta mode")
+    assertEqual(parseExecMeta(["exec=uv", "run", "python"]).interpreter, "uv", "parseExecMeta exec=uv")
+    console.log("✓ parseExecMeta")
+
+    // Test: getNestedValue
+    const obj = { a: { b: { c: "deep" } }, arr: [1, 2, 3] }
+    assertEqual(getNestedValue(obj, "a.b.c"), "deep", "getNestedValue deep")
+    assertEqual(getNestedValue(obj, "arr.0"), 1, "getNestedValue array")
+    assertEqual(getNestedValue(obj, "missing"), undefined, "getNestedValue missing")
+    console.log("✓ getNestedValue")
+
+    // Test: interpolate
+    const meta = { name: "Alice", count: 5, nested: { val: "x" } }
+    assertEqual(interpolate("Hello $name", meta), 'Hello "Alice"', "interpolate string")
+    assertEqual(interpolate("Count: $count", meta), "Count: 5", "interpolate number")
+    assertEqual(interpolate("Nested: $nested.val", meta), 'Nested: "x"', "interpolate nested")
+    assert(interpolate("All: $$", meta).includes('"name":"Alice"'), "interpolate $$ includes metadata")
+    assertEqual(interpolate("Raw $missing", meta), "Raw null", "interpolate missing")
+    console.log("✓ interpolate")
+
+    console.log("\n✅ All tests passed!")
+}
+
+// Run tests if executed directly
+if (import.meta.url === `file://${process.argv[1]}`) {
+    runTests()
 }
