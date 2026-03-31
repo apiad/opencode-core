@@ -34,7 +34,7 @@ const COMMANDS_DIR = ".opencode/commands"
 const sessionStates = new Map()
 
 async function log(client, msg) {
-    console.error("INFO [literate-commands]", msg)
+    // console.error("INFO [literate-commands]", msg)
 }
 
 // Simple YAML check for literate: true
@@ -202,7 +202,8 @@ function parseNestedYaml(text) {
             }
         } else if (currentNested !== null) {
             // We're in a nested block
-            const nestedMatch = trimmed.match(/^(\w+\??)\s*:\s*(.*)$/)
+            // Allow any characters in the key (including spaces, quotes, operators like ===)
+            const nestedMatch = trimmed.match(/^(.+?)\s*:\s*(.*)$/)
             if (nestedMatch) {
                 const [nestedKey, nestedValue] = nestedMatch.slice(1)
                 currentNested[nestedKey] = parseValue(nestedValue)
@@ -585,6 +586,136 @@ function processParse(step, responseText, metadata, client) {
     }
 }
 
+// ============================================================================
+// Step Routing (next config)
+// ============================================================================
+
+/**
+ * Evaluate a condition string against metadata.
+ * condition: "role === 'admin'" → true if metadata.role === 'admin'
+ * Undefined variables in metadata are accessible as undefined.
+ */
+function evaluateCondition(condition, metadata) {
+    try {
+        // Get all unique identifiers from the condition
+        const identifierPattern = /[A-Za-z_$][A-Za-z0-9_$]*/g
+        const identifiers = [...new Set(condition.match(identifierPattern) || [])]
+
+        // Filter to only known variables (from metadata or JavaScript built-ins)
+        const knownVars = identifiers.filter(id => {
+            // Skip JavaScript keywords and built-ins
+            if (['true', 'false', 'null', 'undefined', 'NaN', 'Infinity'].includes(id)) return false
+            if (['typeof', 'void', 'delete', 'in', 'instanceof'].includes(id)) return false
+            return true
+        })
+
+        // Get values from metadata (undefined if not present)
+        const values = knownVars.map(v => metadata[v])
+
+        // Create a function with all variables as parameters
+        const fn = new Function(
+            ...knownVars,
+            `"use strict"; return (${condition});`
+        )
+
+        return fn(...values)
+    } catch (e) {
+        log(null, `[literate-commands] Condition eval error: ${e.message}`)
+        return false
+    }
+}
+
+/**
+ * Find step index by its step name in config.
+ */
+function findStepByName(steps, name) {
+    for (let i = 0; i < steps.length; i++) {
+        if (steps[i].config.step === name) {
+            return i
+        }
+    }
+    return -1
+}
+
+/**
+ * Resolve the next step index based on `next` config.
+ *
+ * Syntax:
+ *   next: step-name           → simple redirect
+ *   next:                     → conditional map
+ *     condition: step          → evaluate condition, first match wins
+ *     _: step                 → default fallback (only if no condition matched)
+ *
+ * Returns: step index, or null to continue sequential
+ */
+function resolveNextStep(next, steps, metadata) {
+    if (!next) {
+        return null
+    }
+
+    // Simple string: next: step-name
+    if (typeof next === "string") {
+        const index = findStepByName(steps, next)
+        if (index !== -1) {
+            return index
+        }
+        log(null, `[literate-commands] next: "${next}" not found, continuing sequential`)
+        return null
+    }
+
+    // Object: conditional map
+    if (typeof next === "object") {
+        let conditionMatched = false
+        let defaultStep = null
+
+        log(null, `[literate-commands] resolveNextStep: next config = ${JSON.stringify(next)}, metadata = ${JSON.stringify(metadata)}`)
+
+        // Check each key in order
+        for (const [key, value] of Object.entries(next)) {
+            log(null, `[literate-commands] Checking key: "${key}" = "${value}"`)
+
+            if (key === "_") {
+                // Remember default fallback (but don't use yet)
+                defaultStep = value
+                log(null, `[literate-commands] Found default fallback: "${value}"`)
+                continue
+            }
+
+            // Evaluate condition
+            const evalResult = evaluateCondition(key, metadata)
+            log(null, `[literate-commands] evaluateCondition("${key}", ...) = ${evalResult}`)
+
+            if (evalResult) {
+                conditionMatched = true
+                const index = findStepByName(steps, value)
+                if (index !== -1) {
+                    log(null, `[literate-commands] Condition matched! Routing to step ${index}`)
+                    return index
+                }
+                log(null, `[literate-commands] next condition "${key}" matched but step "${value}" not found`)
+                // Don't fall through to _ - this condition explicitly matched but target is invalid
+                break
+            }
+        }
+
+        // If no condition matched, use default fallback
+        if (!conditionMatched && defaultStep !== null) {
+            log(null, `[literate-commands] No condition matched, using default fallback: "${defaultStep}"`)
+            const index = findStepByName(steps, defaultStep)
+            if (index !== -1) {
+                return index
+            }
+            log(null, `[literate-commands] next _: "${defaultStep}" not found, continuing sequential`)
+        }
+
+        // No match found → continue sequential
+        log(null, `[literate-commands] No route match, continuing sequential`)
+        return null
+    }
+
+    return null
+}
+
 export default async function literateCommandsPlugin({ client, $ }) {
     await log(client, "[literate-commands] Plugin initialized")
 
@@ -684,13 +815,23 @@ export default async function literateCommandsPlugin({ client, $ }) {
                 const parseResult = processParse(step, responseText, state.metadata, client)
 
                 if (parseResult.success) {
-                    // Parse succeeded! Advance step, then inject NEXT step
+                    // Parse succeeded!
                     state.awaitingRetry = false
                     state.awaitingResponse = false
                     state.pendingParse = null
                     state.retries = 3
-                    state.currentStep++
-                    await log(client, `[literate-commands] Parse succeeded, advancing to step ${state.currentStep}, metadata: ${JSON.stringify(state.metadata)}`)
+                    await log(client, `[literate-commands] Parse succeeded, metadata: ${JSON.stringify(state.metadata)}`)
+
+                    // Check for `next` routing on CURRENT step
+                    const routedIndex = resolveNextStep(step.config.next, state.steps, state.metadata)
+                    if (routedIndex !== null) {
+                        await log(client, `[literate-commands] Routing to step ${routedIndex} via next config`)
+                        state.currentStep = routedIndex
+                    } else {
+                        // No routing, advance sequentially
+                        state.currentStep++
+                        await log(client, `[literate-commands] Advancing to step ${state.currentStep}`)
+                    }
 
                     // Get NEXT step and inject it
                     const nextStepIndex = state.currentStep
@@ -720,8 +861,16 @@ export default async function literateCommandsPlugin({ client, $ }) {
                         body: { parts: [{ type: "text", text: finalPrompt }] }
                     })
 
+                    // If no parse config on next step, advance after injection
+                    // (routing will be handled when that step's response is parsed)
                     if (!nextStep.config.parse) {
-                        state.currentStep++
+                        // Check if next step itself has `next` for immediate routing
+                        const nextRoutedIndex = resolveNextStep(nextStep.config.next, state.steps, state.metadata)
+                        if (nextRoutedIndex !== null) {
+                            state.currentStep = nextRoutedIndex
+                        } else {
+                            state.currentStep++
+                        }
                     }
                     return
                 } else {
@@ -774,10 +923,23 @@ export default async function literateCommandsPlugin({ client, $ }) {
                 body: { parts: [{ type: "text", text: finalPrompt }] }
             })
 
-            // If no parse config, advance to next step
+            // Check for stop: true - end the command
+            if (step.config.stop === true) {
+                await log(client, `[literate-commands] Stop requested, ending command`)
+                sessionStates.delete(sessionID)
+                return
+            }
+
+            // If no parse config, check for routing
             if (!step.config.parse) {
-                await log(client, `[literate-commands] Advancing to step ${stepIndex + 1}`)
-                state.currentStep++
+                const routedIndex = resolveNextStep(step.config.next, state.steps, state.metadata)
+                if (routedIndex !== null) {
+                    await log(client, `[literate-commands] Routing to step ${routedIndex} via next config`)
+                    state.currentStep = routedIndex
+                } else {
+                    await log(client, `[literate-commands] Advancing to step ${stepIndex + 1}`)
+                    state.currentStep++
+                }
             }
         }
     }
@@ -993,6 +1155,180 @@ Done.`
     assertEqual(fencedResult.data.msg, "fenced", "parseResponse fenced JSON extraction")
     console.log("✓ parseResponse fenced JSON")
 
+    // ============================================================================
+    // Routing Tests (Phase 7)
+    // ============================================================================
+
+    console.log("\n--- Routing Tests ---\n")
+
+    // Test: evaluateCondition - simple equality
+    assertEqual(evaluateCondition("role === 'admin'", { role: 'admin' }), true, "evaluateCondition admin true")
+    assertEqual(evaluateCondition("role === 'admin'", { role: 'user' }), false, "evaluateCondition admin false")
+    console.log("✓ evaluateCondition equality")
+
+    // Test: evaluateCondition - string with double quotes
+    assertEqual(evaluateCondition('role === "admin"', { role: 'admin' }), true, "evaluateCondition double quotes")
+    console.log("✓ evaluateCondition double quotes")
+
+    // Test: evaluateCondition - number comparison
+    assertEqual(evaluateCondition("age > 18", { age: 25 }), true, "evaluateCondition age > 18 true")
+    assertEqual(evaluateCondition("age > 18", { age: 15 }), false, "evaluateCondition age > 18 false")
+    assertEqual(evaluateCondition("age >= 18", { age: 18 }), true, "evaluateCondition age >= 18")
+    assertEqual(evaluateCondition("age < 21", { age: 20 }), true, "evaluateCondition age < 21")
+    console.log("✓ evaluateCondition number comparison")
+
+    // Test: evaluateCondition - boolean variable
+    assertEqual(evaluateCondition("isAdmin", { isAdmin: true }), true, "evaluateCondition boolean true")
+    assertEqual(evaluateCondition("isAdmin", { isAdmin: false }), false, "evaluateCondition boolean false")
+    console.log("✓ evaluateCondition boolean")
+
+    // Test: evaluateCondition - AND/OR logic
+    assertEqual(evaluateCondition("role === 'admin' && age > 18", { role: 'admin', age: 25 }), true, "evaluateCondition AND true")
+    assertEqual(evaluateCondition("role === 'admin' && age > 18", { role: 'admin', age: 15 }), false, "evaluateCondition AND false")
+    assertEqual(evaluateCondition("role === 'admin' || role === 'editor'", { role: 'user' }), false, "evaluateCondition OR false")
+    assertEqual(evaluateCondition("role === 'admin' || role === 'editor'", { role: 'editor' }), true, "evaluateCondition OR true")
+    console.log("✓ evaluateCondition AND/OR logic")
+
+    // Test: evaluateCondition - string methods
+    assertEqual(evaluateCondition("name.includes('John')", { name: 'John Doe' }), true, "evaluateCondition string includes")
+    assertEqual(evaluateCondition("email.endsWith('@corp.com')", { email: 'user@corp.com' }), true, "evaluateCondition endsWith")
+    assertEqual(evaluateCondition("name.toLowerCase() === 'alice'", { name: 'ALICE' }), true, "evaluateCondition toLowerCase")
+    console.log("✓ evaluateCondition string methods")
+
+    // Test: evaluateCondition - undefined variable
+    assertEqual(evaluateCondition("missing === undefined", {}), true, "evaluateCondition undefined variable")
+    assertEqual(evaluateCondition("name !== undefined", {}), false, "evaluateCondition missing variable")
+    console.log("✓ evaluateCondition undefined handling")
+
+    // Test: evaluateCondition - invalid expression
+    assertEqual(evaluateCondition("role ===", {}), false, "evaluateCondition invalid expression")
+    console.log("✓ evaluateCondition invalid expression handling")
+
+    // Test: findStepByName - basic
+    const testSteps = [
+        { config: { step: 'ask-role' }, prompt: 'What role?' },
+        { config: { step: 'admin-panel' }, prompt: 'Admin panel' },
+        { config: { step: 'user-panel' }, prompt: 'User panel' }
+    ]
+    assertEqual(findStepByName(testSteps, 'admin-panel'), 1, "findStepByName found")
+    assertEqual(findStepByName(testSteps, 'user-panel'), 2, "findStepByName user-panel")
+    assertEqual(findStepByName(testSteps, 'missing'), -1, "findStepByName not found")
+    assertEqual(findStepByName([], 'anything'), -1, "findStepByName empty array")
+    console.log("✓ findStepByName")
+
+    // Test: resolveNextStep - simple string redirect
+    assertEqual(resolveNextStep("admin-panel", testSteps, {}), 1, "resolveNextStep simple string")
+    assertEqual(resolveNextStep("user-panel", testSteps, {}), 2, "resolveNextStep another step")
+    assertEqual(resolveNextStep("missing-step", testSteps, {}), null, "resolveNextStep not found returns null")
+    console.log("✓ resolveNextStep simple string")
+
+    // Test: resolveNextStep - no next config
+    assertEqual(resolveNextStep(null, testSteps, {}), null, "resolveNextStep null")
+    assertEqual(resolveNextStep(undefined, testSteps, {}), null, "resolveNextStep undefined")
+    assertEqual(resolveNextStep("", testSteps, {}), null, "resolveNextStep empty string")
+    console.log("✓ resolveNextStep no config")
+
+    // Test: resolveNextStep - conditional map, first match wins
+    const roleConditions = {
+        "role === 'admin'": 'admin-panel',
+        "role === 'user'": 'user-panel',
+        _: 'ask-role'  // fallback to first step
+    }
+    assertEqual(resolveNextStep(roleConditions, testSteps, { role: 'admin' }), 1, "resolveNextStep admin condition")
+    assertEqual(resolveNextStep(roleConditions, testSteps, { role: 'user' }), 2, "resolveNextStep user condition")
+    assertEqual(resolveNextStep(roleConditions, testSteps, { role: 'guest' }), 0, "resolveNextStep guest falls to _")
+    console.log("✓ resolveNextStep conditional map")
+
+    // Test: resolveNextStep - conditional map, no match, no fallback
+    const noFallbackConditions = {
+        "role === 'admin'": 'admin-panel',
+        "role === 'user'": 'user-panel'
+    }
+    assertEqual(resolveNextStep(noFallbackConditions, testSteps, { role: 'guest' }), null, "resolveNextStep no match, no fallback")
+    console.log("✓ resolveNextStep no match, no fallback")
+
+    // Test: resolveNextStep - conditional with boolean variable
+    const boolConditions = {
+        "isAdmin": 'admin-panel',
+        _: 'user-panel'
+    }
+    assertEqual(resolveNextStep(boolConditions, testSteps, { isAdmin: true }), 1, "resolveNextStep bool true")
+    assertEqual(resolveNextStep(boolConditions, testSteps, { isAdmin: false }), 2, "resolveNextStep bool false")
+    console.log("✓ resolveNextStep boolean condition")
+
+    // Test: resolveNextStep - conditional with number comparison
+    const ageConditions = {
+        "age >= 18": 'adult-panel',
+        _: 'minor-panel'
+    }
+    const minorSteps = [
+        { config: { step: 'ask-age' }, prompt: 'How old?' },
+        { config: { step: 'adult-panel' }, prompt: 'Adult' },
+        { config: { step: 'minor-panel' }, prompt: 'Minor' }
+    ]
+    assertEqual(resolveNextStep(ageConditions, minorSteps, { age: 25 }), 1, "resolveNextStep adult age")
+    assertEqual(resolveNextStep(ageConditions, minorSteps, { age: 15 }), 2, "resolveNextStep minor age")
+    console.log("✓ resolveNextStep number comparison")
+
+    // Test: resolveNextStep - first match wins (order matters)
+    const priorityConditions = {
+        "role === 'admin'": 'admin-panel',
+        "role !== 'user'": 'user-panel',  // Should not match admin (already matched), but 'other' != 'user' so matches here
+        _: 'ask-role'
+    }
+    assertEqual(resolveNextStep(priorityConditions, testSteps, { role: 'admin' }), 1, "resolveNextStep first match wins")
+    assertEqual(resolveNextStep(priorityConditions, testSteps, { role: 'other' }), 2, "resolveNextStep falls through to user-panel")
+    console.log("✓ resolveNextStep first match wins")
+
+    // Test: resolveNextStep - complex conditions
+    const complexConditions = {
+        "role === 'admin' && age >= 18": 'full-admin',
+        "role === 'admin'": 'limited-admin',
+        "age >= 18": 'adult-panel',
+        _: 'default'
+    }
+    const complexSteps = [
+        { config: { step: 'start' }, prompt: 'Start' },
+        { config: { step: 'full-admin' }, prompt: 'Full admin' },
+        { config: { step: 'limited-admin' }, prompt: 'Limited admin' },
+        { config: { step: 'adult-panel' }, prompt: 'Adult panel' },
+        { config: { step: 'default' }, prompt: 'Default' }
+    ]
+    assertEqual(resolveNextStep(complexConditions, complexSteps, { role: 'admin', age: 25 }), 1, "resolveNextStep complex AND match")
+    assertEqual(resolveNextStep(complexConditions, complexSteps, { role: 'admin', age: 15 }), 2, "resolveNextStep complex partial")
+    assertEqual(resolveNextStep(complexConditions, complexSteps, { role: 'user', age: 20 }), 3, "resolveNextStep complex adult")
+    assertEqual(resolveNextStep(complexConditions, complexSteps, { role: 'guest', age: 10 }), 4, "resolveNextStep complex default")
+    console.log("✓ resolveNextStep complex conditions")
+
+    // Test: resolveNextStep - string contains
+    const stringConditions = {
+        "email.includes('@admin')": 'admin-panel',
+        "email.includes('@')": 'user-panel',
+        _: 'ask-role'
+    }
+    assertEqual(resolveNextStep(stringConditions, testSteps, { email: 'boss@admin.com' }), 1, "resolveNextStep string contains admin")
+    assertEqual(resolveNextStep(stringConditions, testSteps, { email: 'user@example.com' }), 2, "resolveNextStep string contains @")
+    assertEqual(resolveNextStep(stringConditions, testSteps, { email: 'invalid-email' }), 0, "resolveNextStep string no match")
+    console.log("✓ resolveNextStep string contains")
+
+    // Test: resolveNextStep - target step not found
+    const brokenConditions = {
+        "role === 'admin'": 'nonexistent-step',
+        _: 'ask-role'  // fallback exists, but admin-panel doesn't
+    }
+    assertEqual(resolveNextStep(brokenConditions, testSteps, { role: 'admin' }), null, "resolveNextStep target not found")
+    assertEqual(resolveNextStep(brokenConditions, testSteps, { role: 'guest' }), 0, "resolveNextStep fallback works")
+    console.log("✓ resolveNextStep target step not found")
+
+    // Test: resolveNextStep - metadata with special characters
+    assertEqual(resolveNextStep({ "name.includes(\"John\")": 'admin-panel' }, testSteps, { name: "John Doe" }), 1, "resolveNextStep quotes in condition")
+    console.log("✓ resolveNextStep special characters in metadata")
+
+    // Test: resolveNextStep - empty metadata
+    assertEqual(resolveNextStep({ "isAdmin": 'admin-panel', _: 'user-panel' }, testSteps, {}), 2, "resolveNextStep empty metadata falls to _")
+    console.log("✓ resolveNextStep empty metadata")
+
+    console.log("\n✅ Routing tests passed!")
     console.log("\n✅ Parse Functionality tests passed!")
     console.log("\n✅ All tests passed!")
 }
