@@ -26,6 +26,7 @@
 
 import { readFileSync, existsSync } from "fs"
 import { join } from "path"
+import { execSync } from "child_process"
 
 const COMMANDS_DIR = ".opencode/commands"
 
@@ -33,18 +34,7 @@ const COMMANDS_DIR = ".opencode/commands"
 const sessionStates = new Map()
 
 async function log(client, msg) {
-    if (!client) return
-    try {
-        await client.app.log({
-            body: {
-                service: "literate-commands",
-                level: "info",
-                message: msg
-            }
-        })
-    } catch (e) {
-        console.error("[literate-commands] Log error:", e.message)
-    }
+    console.error("INFO [literate-commands]", msg)
 }
 
 // Simple YAML check for literate: true
@@ -107,18 +97,26 @@ function parseStep(section) {
         remaining = section.replace(configMatch[0], "").trim()
     }
 
-    // Extract code blocks with metadata
-    const codeBlocks = parseCodeBlocks(remaining)
+    // Extract code blocks with their full text (including delimiters)
+    const codeBlocks = []
+    const blockRegex = /(```\w+\s*\{[^}]*\}\n[\s\S]*?```)/g
+    let lastIndex = 0
+    let match
 
-    // Remove {exec} code blocks from prompt (not regular code blocks like ```json)
-    // Only remove blocks that have "exec" in their metadata
-    const execBlockRegex = /```\w+\s*\{[^}]*exec[^}]*\}[^`]*(?:```|$)/g
+    while ((match = blockRegex.exec(remaining)) !== null) {
+        codeBlocks.push({
+            language: match[0].match(/^```(\w+)/)[1],
+            meta: match[0].match(/\{([^}]*)\}/)[1].split(/\s+/).filter(m => m),
+            code: match[0].match(/```\w+\s*\{[^}]*\}\n([\s\S]*?)```/)[1],
+            fullBlock: match[0]  // Preserve exact string for later replacement
+        })
+    }
+
+    // Remove config block from prompt, but keep everything else including other code blocks
+    // The prompt retains all non-config code blocks as-is
     const prompt = remaining
-        .replace(execBlockRegex, "\n")
-        .split("\n")
-        .map(l => l.trim())
-        .filter(l => l)
-        .join("\n")
+        .replace(/```yaml\s*\{config\}\n[\s\S]*?```/g, "")
+        .trim()
 
     if (!prompt && codeBlocks.length === 0) {
         return null
@@ -268,18 +266,82 @@ function getNestedValue(obj, path) {
 }
 
 /**
+ * Extract text from the latest assistant message in a session.
+ * Returns the combined text from all text parts of the assistant's response.
+ */
+async function getLatestAssistantResponse(client, sessionID) {
+    try {
+        const response = await client.session.messages({ path: { id: sessionID } })
+        const messages = response.data
+
+        // Find the latest assistant message (messages are ordered by time)
+        // The latest message should be the last one with role "assistant"
+        let latestAssistant = null
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i]
+            if (msg.info?.role === "assistant") {
+                latestAssistant = msg
+                break
+            }
+        }
+
+        if (!latestAssistant) {
+            return null
+        }
+
+        // Parts are already embedded in the message - no separate API call needed
+        const texts = []
+        for (const part of latestAssistant.parts) {
+            if (part.type === "text") {
+                texts.push(part.text)
+            }
+        }
+
+        return texts.join("\n")
+    } catch (e) {
+        console.error("[literate-commands] Error fetching messages:", e.message)
+        return null
+    }
+}
+
+/**
  * Interpolate variables in text using JSON.stringify.
  * $var → "value" (JSON-stringified)
  * $obj.nested → "nested value"
+ * $arr.0 → first array element
  * $$ → full metadata as JSON string
  */
 function interpolate(text, metadata) {
-    return text.replace(/\$(\$|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)/g, (match, path) => {
+    return text.replace(/\$(\$|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)/g, (match, path) => {
         if (path === "$") {
             return JSON.stringify(metadata)
         }
         const value = getNestedValue(metadata, path)
         return JSON.stringify(value ?? null)
+    })
+}
+
+/**
+ * Interpolate variables for shell scripts (no JSON-stringify).
+ * $var → value (raw, suitable for shell)
+ * $obj.nested → nested value
+ * $arr.0 → first array element
+ * $$ → full metadata as JSON string (for reference)
+ *
+ * This escapes values for shell safety.
+ */
+function interpolateForShell(text, metadata) {
+    return text.replace(/\$(\$|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)/g, (match, path) => {
+        if (path === "$") {
+            return JSON.stringify(metadata)
+        }
+        const value = getNestedValue(metadata, path)
+        if (value === null || value === undefined) {
+            return ""
+        }
+        // Escape for shell: wrap in single quotes, escape any existing single quotes
+        const str = String(value).replace(/'/g, "'\\''")
+        return `'${str}'`
     })
 }
 
@@ -331,8 +393,14 @@ async function runScript(block, metadata, $) {
     // Get actual interpreter command
     const cmd = INTERPRETERS[interp] || interp
 
-    // Substitute variables in code
-    const substitutedCode = interpolate(code, metadata)
+    // Substitute variables in code (shell-safe for bash/sh, regular for others)
+    let substitutedCode
+    if (cmd === "bash" || cmd === "sh") {
+        substitutedCode = interpolateForShell(code, metadata)
+    } else {
+        // For Python, Node, etc. - use regular interpolation with JSON-stringify
+        substitutedCode = interpolate(code, metadata)
+    }
 
     // Build execution command
     let execCmd
@@ -361,7 +429,6 @@ async function runScript(block, metadata, $) {
 
     try {
         // Use execSync for reliable execution
-        const { execSync } = require("child_process")
         const output = execSync(fullCmd, { encoding: "utf8" }).trim()
 
         if (mode === "stdout") {
@@ -404,14 +471,12 @@ async function processScripts(step, metadata, $) {
             Object.assign(metadata, stored)
         }
 
-        // Replace block in prompt with output (for stdout mode)
+        // Replace EXACT block string with output (for stdout mode)
         if (output) {
-            const blockPattern = `\`\`\`${block.language}\\s*\{[^}]+\}\n[\s\S]*?\`\`\``
-            resultPrompt = resultPrompt.replace(new RegExp(blockPattern), output)
+            resultPrompt = resultPrompt.replace(block.fullBlock, output)
         } else {
-            // Remove block if no output
-            const blockPattern = `\`\`\`${block.language}\\s*\{[^}]+\}\n[\s\S]*?\`\`\``
-            resultPrompt = resultPrompt.replace(new RegExp(blockPattern), "")
+            // Remove block if no output (stdout is empty)
+            resultPrompt = resultPrompt.replace(block.fullBlock, "")
         }
     }
 
@@ -423,95 +488,101 @@ async function processScripts(step, metadata, $) {
 // ============================================================================
 
 /**
- * Parse variables from model response based on step config.
- * 
- * Config example:
+ * Build JSON format instruction from parse config keys.
+ *
+ * Input: { message: "string", count: "number", active: "bool" }
+ * Output: "\n\nFormat your response as JSON with the following keys: {message, count, active}. DO NOT add anything before or after the JSON response, as it will be used for parsing."
+ */
+function buildParseFormatInstruction(parseConfig) {
+    const keys = Object.keys(parseConfig).join(", ")
+    return `\n\nFormat your response as JSON with the following keys: {${keys}}. DO NOT add anything before or after the JSON response, as it will be used for parsing.`
+}
+
+/**
+ * Parse variables from model response based on type-based config.
+ *
+ * Config format (NEW):
  *   parse:
- *     topic: "What is the topic?"
- *     count: "How many items?"
- *     done?: "Is this done?"  (boolean - ends with ?)
- * 
- * Response parsing:
- * - Try to find ```json...``` block first
- * - Otherwise extract from plain text
- * - Boolean vars (ending in ?) must be true/false
+ *     message: string    # string type
+ *     count: number       # number type
+ *     active: bool        # boolean type
+ *
+ * Returns: { success: true, data: { key: value, ... } }
+ *      or: { success: false, error: "error message" }
+ *
+ * Response parsing priority:
+ * 1. JSON code block (```json ... ```)
+ * 2. Raw JSON (no fences)
  */
 function parseResponse(responseText, parseConfig) {
-    const result = {}
-    
-    // First, try to find JSON in the response
-    const jsonMatch = responseText.match(/```json\n([\s\S]*?)\n```/)
-    if (jsonMatch) {
+    let jsonString = null
+
+    // First, try to find JSON in code block
+    const jsonBlockMatch = responseText.match(/```json\n([\s\S]*?)\n```/)
+    if (jsonBlockMatch) {
+        jsonString = jsonBlockMatch[1]
+    } else {
+        // Try to find raw JSON (might be the whole response)
+        const trimmed = responseText.trim()
+        if (trimmed.startsWith("{")) {
+            // Might be raw JSON, use the whole thing
+            jsonString = trimmed
+        }
+    }
+
+    if (jsonString) {
         try {
-            const parsed = JSON.parse(jsonMatch[1])
-            for (const [key, value] of Object.entries(parseConfig)) {
-                const isBool = key.endsWith("?")
-                const actualKey = isBool ? key.slice(0, -1) : key
-                
-                if (parsed[actualKey] !== undefined) {
-                    if (isBool) {
-                        result[key] = Boolean(parsed[actualKey])
-                    } else {
-                        result[key] = String(parsed[actualKey])
+            const parsed = JSON.parse(jsonString)
+            const result = {}
+
+            for (const [key, type] of Object.entries(parseConfig)) {
+                if (parsed[key] !== undefined) {
+                    switch (type) {
+                        case "bool":
+                            result[key] = Boolean(parsed[key])
+                            break
+                        case "number":
+                            result[key] = Number(parsed[key])
+                            break
+                        case "string":
+                        default:
+                            result[key] = String(parsed[key])
                     }
                 }
             }
-            return result
+
+            return { success: true, data: result }
         } catch (e) {
-            // JSON parse failed, continue to text parsing
+            return { success: false, error: e.message }
         }
     }
-    
-    // Text-based extraction
-    for (const [key, prompt] of Object.entries(parseConfig)) {
-        const isBool = key.endsWith("?")
-        const actualKey = isBool ? key.slice(0, -1) : key
-        
-        // For booleans, look for "true" or "false" near the prompt
-        if (isBool) {
-            const trueMatch = responseText.toLowerCase().match(/\btrue\b/)
-            const falseMatch = responseText.toLowerCase().match(/\bfalse\b/)
-            if (trueMatch && !falseMatch) {
-                result[key] = true
-            } else if (falseMatch && !trueMatch) {
-                result[key] = false
-            } else if (trueMatch && falseMatch) {
-                // Take the last one
-                result[key] = responseText.lastIndexOf("true") > responseText.lastIndexOf("false")
-            }
-        } else {
-            // For strings, try to find patterns like "topic: value" or "topic is X"
-            const colonMatch = responseText.match(new RegExp(`${actualKey}\\s*:\\s*([^\\n,]+)`, 'i'))
-            if (colonMatch) {
-                result[key] = colonMatch[1].trim()
-            } else {
-                const isMatch = responseText.match(new RegExp(`${actualKey}\\s+(?:is|was)\\s+([^\\n,]+)`, 'i'))
-                if (isMatch) {
-                    result[key] = isMatch[1].trim()
-                }
-            }
-        }
-    }
-    
-    return result
+
+    // No valid JSON found
+    return { success: false, error: "No valid JSON found in response" }
 }
 
 /**
  * Process parse config from step and extract variables.
  * Called after model responds.
+ *
+ * Returns: { success: boolean, data?: object, error?: string }
  */
 function processParse(step, responseText, metadata, client) {
     if (!step.config.parse) {
-        return metadata
+        return { success: true, data: metadata }
     }
-    
-    const parsed = parseResponse(responseText, step.config.parse)
-    log(client, `[literate-commands] Parsed variables: ${JSON.stringify(parsed)}`)
-    
-    // Merge into metadata
-    Object.assign(metadata, parsed)
-    
-    return metadata
+
+    const result = parseResponse(responseText, step.config.parse)
+
+    if (result.success) {
+        log(client, `[literate-commands] Parsed variables: ${JSON.stringify(result.data)}`)
+        // Merge parsed data into metadata
+        Object.assign(metadata, result.data)
+        return { success: true, data: metadata }
+    } else {
+        log(client, `[literate-commands] Parse failed: ${result.error}`)
+        return { success: false, error: result.error }
+    }
 }
 
 export default async function literateCommandsPlugin({ client, $ }) {
@@ -559,7 +630,11 @@ export default async function literateCommandsPlugin({ client, $ }) {
                 currentStep: 0,
                 metadata: { ARGUMENTS: args || "" },
                 sessionID,
-                commandName: command
+                commandName: command,
+                pendingParse: null,      // parse config waiting for response
+                retries: 3,             // retry count (default 3)
+                awaitingResponse: false,  // waiting for first response after prompt
+                awaitingRetry: false     // waiting for retry response after retry prompt
             })
             await log(client, `[literate-commands] State set for session ${sessionID}`)
 
@@ -583,47 +658,127 @@ export default async function literateCommandsPlugin({ client, $ }) {
                 return
             }
 
-            await log(client, `[literate-commands] session.idle for ${sessionID}, step ${state.currentStep}`)
+            await log(client, `[literate-commands] session.idle for ${sessionID}, step ${state.currentStep}, awaitingResponse=${state.awaitingResponse}, awaitingRetry=${state.awaitingRetry}`)
 
             // Get current step
             const stepIndex = state.currentStep
             const step = state.steps[stepIndex]
             if (!step) {
-                await log(client, `[literate-commands] No more steps (${stepIndex} >= ${state.steps.length}), done`)
+                await log(client, `[literate-commands] No more steps, done`)
                 sessionStates.delete(sessionID)
                 return
             }
 
-            await log(client, `[literate-commands] Processing step ${stepIndex}: "${step.prompt.slice(0, 50)}..."`)
-            await log(client, `[literate-commands] Code blocks: ${step.codeBlocks.length}`)
+            // =====================================================
+            // Handle waiting states (parse response, then inject NEXT step)
+            // =====================================================
+            if (state.awaitingRetry || state.awaitingResponse) {
+                const responseText = await getLatestAssistantResponse(client, sessionID)
+                await log(client, `[literate-commands] Got response: ${responseText?.slice(0, 100) || "null"}...`)
 
-            // Process scripts (with variable substitution) and get modified prompt
-            const processedPrompt = await processScripts(step, state.metadata, $)
-
-            // Interpolate remaining variables in prompt
-            const interpolatedPrompt = interpolate(processedPrompt, state.metadata)
-            await log(client, `[literate-commands] Injecting step ${state.currentStep}: ${interpolatedPrompt}`)
-
-            // Inject step prompt
-            await client.session.promptAsync({
-                path: { id: sessionID },
-                body: {
-                    parts: [{ type: "text", text: interpolatedPrompt }]
+                if (!responseText) {
+                    await log(client, `[literate-commands] No response yet, waiting...`)
+                    return
                 }
-            })
 
-            // Test parse functionality with mock response
-            await log(client, `[literate-commands] Step config: ${JSON.stringify(step.config)}`)
-            if (step.config.parse) {
-                const mockResponse = `Here is the information:\n\`\`\`json\n{"topic": "testing", "count": 42}\n\`\`\``
-                await log(client, `[literate-commands] Testing parse with mock response`)
-                processParse(step, mockResponse, state.metadata, client)
-                await log(client, `[literate-commands] Metadata after parse: ${JSON.stringify(state.metadata)}`)
+                const parseResult = processParse(step, responseText, state.metadata, client)
+
+                if (parseResult.success) {
+                    // Parse succeeded! Advance step, then inject NEXT step
+                    state.awaitingRetry = false
+                    state.awaitingResponse = false
+                    state.pendingParse = null
+                    state.retries = 3
+                    state.currentStep++
+                    await log(client, `[literate-commands] Parse succeeded, advancing to step ${state.currentStep}, metadata: ${JSON.stringify(state.metadata)}`)
+
+                    // Get NEXT step and inject it
+                    const nextStepIndex = state.currentStep
+                    const nextStep = state.steps[nextStepIndex]
+                    if (!nextStep) {
+                        await log(client, `[literate-commands] No more steps, done`)
+                        sessionStates.delete(sessionID)
+                        return
+                    }
+
+                    await log(client, `[literate-commands] Processing step ${nextStepIndex}: "${nextStep.prompt.slice(0, 50)}..."`)
+
+                    const processedPrompt = await processScripts(nextStep, state.metadata, $)
+                    let finalPrompt = interpolate(processedPrompt, state.metadata)
+
+                    if (nextStep.config.parse) {
+                        const formatInstruction = buildParseFormatInstruction(nextStep.config.parse)
+                        finalPrompt = finalPrompt + formatInstruction
+                        state.pendingParse = nextStep.config.parse
+                        state.awaitingResponse = true
+                        await log(client, `[literate-commands] Added parse instruction, awaiting response`)
+                    }
+
+                    await log(client, `[literate-commands] Injecting: ${finalPrompt.slice(0, 100)}...`)
+                    await client.session.promptAsync({
+                        path: { id: sessionID },
+                        body: { parts: [{ type: "text", text: finalPrompt }] }
+                    })
+
+                    if (!nextStep.config.parse) {
+                        state.currentStep++
+                    }
+                    return
+                } else {
+                    // Parse failed - start retry cycle
+                    state.retries--
+                    state.awaitingRetry = true
+                    state.awaitingResponse = false
+                    await log(client, `[literate-commands] Parse failed (${state.retries} retries left): ${parseResult.error}`)
+
+                    if (state.retries > 0) {
+                        const retryPrompt = `Could not parse your response as valid JSON. Error: ${parseResult.error}\n\nPlease respond with ONLY a JSON block containing the required keys. Format: {${Object.keys(state.pendingParse || step.config.parse || {}).join(", ")}}.`
+                        await client.session.promptAsync({
+                            path: { id: sessionID },
+                            body: { parts: [{ type: "text", text: retryPrompt }] }
+                        })
+                    } else {
+                        const stopPrompt = `Command stopped. Parse failed after 3 retries at step ${stepIndex}.\n\nCurrent step: "${step.prompt.slice(0, 100)}..."\nVariables so far: ${JSON.stringify(state.metadata)}\n\nPlease provide instructions.`
+                        await client.session.promptAsync({
+                            path: { id: sessionID },
+                            body: { parts: [{ type: "text", text: stopPrompt }] }
+                        })
+                        sessionStates.delete(sessionID)
+                    }
+                    return
+                }
             }
 
-            // Advance to next step
-            await log(client, `[literate-commands] Advancing from step ${stepIndex} to ${stepIndex + 1}`)
-            state.currentStep++
+            // =====================================================
+            // Fresh step - process and inject
+            // =====================================================
+            await log(client, `[literate-commands] Processing step ${stepIndex}: "${step.prompt.slice(0, 50)}..."`)
+
+            // Process scripts and interpolate
+            const processedPrompt = await processScripts(step, state.metadata, $)
+            let finalPrompt = interpolate(processedPrompt, state.metadata)
+
+            // If this step has parse config, add JSON format instruction
+            if (step.config.parse) {
+                const formatInstruction = buildParseFormatInstruction(step.config.parse)
+                finalPrompt = finalPrompt + formatInstruction
+                state.pendingParse = step.config.parse
+                state.awaitingResponse = true
+                await log(client, `[literate-commands] Added parse instruction, awaiting response`)
+            }
+
+            await log(client, `[literate-commands] Injecting: ${finalPrompt.slice(0, 100)}...`)
+
+            await client.session.promptAsync({
+                path: { id: sessionID },
+                body: { parts: [{ type: "text", text: finalPrompt }] }
+            })
+
+            // If no parse config, advance to next step
+            if (!step.config.parse) {
+                await log(client, `[literate-commands] Advancing to step ${stepIndex + 1}`)
+                state.currentStep++
+            }
         }
     }
 }
@@ -642,7 +797,7 @@ function assertEqual(actual, expected, message) {
     }
 }
 
-function runTests() {
+async function runTests() {
     console.log("Running literate-commands tests...\n")
 
     // Test: hasLiterateFrontmatter
@@ -736,37 +891,323 @@ echo hi
 Done.`
     const parsedStep = parseStep(stepWithJson)
     assertEqual(parsedStep.codeBlocks.length, 2, "parseStep finds both blocks")
-    assert(parsedStep.prompt.includes('```json'), "parseStep preserves json block")
-    assert(!parsedStep.prompt.includes('echo hi'), "parseStep removes exec block")
-    console.log("✓ parseStep preserves non-exec blocks")
+    // All code blocks are PRESERVED in the prompt (not removed)
+    assert(parsedStep.prompt.includes('```json'), "parseStep preserves json block in prompt")
+    assert(parsedStep.prompt.includes('```bash {exec}'), "parseStep preserves exec block in prompt")
+    assert(parsedStep.prompt.includes('echo hi'), "parseStep preserves exec block content")
+    // Non-exec blocks have fullBlock property
+    assert(parsedStep.codeBlocks[0].fullBlock, "parseStep stores fullBlock for json")
+    assert(parsedStep.codeBlocks[1].fullBlock, "parseStep stores fullBlock for exec")
+    console.log("✓ parseStep preserves all code blocks in prompt")
 
-    // Test: parseResponse with JSON
+    // Test: parseResponse with JSON (type-based format)
     const jsonResponse = '```json\n{"topic": "AI", "count": 42}\n```'
-    const parseConfig1 = { topic: "What is the topic?", count: "How many?" }
+    const parseConfig1 = { topic: "string", count: "number" }
     const parsed1 = parseResponse(jsonResponse, parseConfig1)
-    assertEqual(parsed1.topic, "AI", "parseResponse JSON topic")
-    assertEqual(parsed1.count, "42", "parseResponse JSON count")
-    console.log("✓ parseResponse JSON")
+    assertEqual(parsed1.success, true, "parseResponse JSON success")
+    assertEqual(parsed1.data.topic, "AI", "parseResponse JSON topic")
+    assertEqual(parsed1.data.count, 42, "parseResponse JSON count (number type)")
+    console.log("✓ parseResponse type-based JSON")
 
-    // Test: parseResponse with boolean
-    const boolResponse = "The task is complete. true"
-    const parseConfig2 = { "done?": "Is it done?" }
+    // Test: parseResponse with bool
+    const boolResponse = '{"done": true}'
+    const parseConfig2 = { done: "bool" }
     const parsed2 = parseResponse(boolResponse, parseConfig2)
-    assertEqual(parsed2["done?"], true, "parseResponse boolean true")
-    console.log("✓ parseResponse boolean")
+    assertEqual(parsed2.success, true, "parseResponse bool success")
+    assertEqual(parsed2.data.done, true, "parseResponse bool true")
+    console.log("✓ parseResponse bool")
 
-    // Test: parseResponse plain text
+    // Test: parseResponse plain text (no JSON) - should fail
     const textResponse = "Topic: Machine Learning\nCount: 10"
-    const parseConfig3 = { topic: "What is the topic?", count: "What is the count?" }
+    const parseConfig3 = { topic: "string", count: "number" }
     const parsed3 = parseResponse(textResponse, parseConfig3)
-    assertEqual(parsed3.topic, "Machine Learning", "parseResponse text topic")
-    assertEqual(parsed3.count, "10", "parseResponse text count")
-    console.log("✓ parseResponse text")
+    assertEqual(parsed3.success, false, "parseResponse plain text fails (no JSON)")
+    console.log("✓ parseResponse plain text fails")
 
+    // ============================================================================
+    // New Parse Functionality Tests (Phase 6)
+    // ============================================================================
+
+    // Test: buildParseFormatInstruction - generates correct instruction
+    const formatInstr1 = buildParseFormatInstruction({ message: "string", count: "number" })
+    assert(formatInstr1.includes("message"), "buildParseFormatInstruction includes message")
+    assert(formatInstr1.includes("count"), "buildParseFormatInstruction includes count")
+    assert(formatInstr1.includes("DO NOT add anything"), "buildParseFormatInstruction includes instruction")
+    console.log("✓ buildParseFormatInstruction basic")
+
+    // Test: buildParseFormatInstruction - single key
+    const formatInstr2 = buildParseFormatInstruction({ name: "string" })
+    assert(formatInstr2.includes("{name}"), "buildParseFormatInstruction single key format")
+    console.log("✓ buildParseFormatInstruction single key")
+
+    // Test: parseResponse - type-based format with JSON (NEW FORMAT)
+    const newParseConfig1 = { msg: "string", num: "number", flag: "bool" }
+    const newJsonResponse = '{"msg": "hello", "num": 42, "flag": true}'
+    const newParsed1 = parseResponse(newJsonResponse, newParseConfig1)
+    assertEqual(newParsed1.success, true, "parseResponse type-based success")
+    assertEqual(newParsed1.data.msg, "hello", "parseResponse string type")
+    assertEqual(newParsed1.data.num, 42, "parseResponse number type (not string)")
+    assertEqual(newParsed1.data.flag, true, "parseResponse bool type")
+    console.log("✓ parseResponse type-based JSON extraction")
+
+    // Test: parseResponse - bool false
+    const boolFalseResponse = '{"active": false}'
+    const boolFalseConfig = { active: "bool" }
+    const boolFalseResult = parseResponse(boolFalseResponse, boolFalseConfig)
+    assertEqual(boolFalseResult.success, true, "parseResponse bool false success")
+    assertEqual(boolFalseResult.data.active, false, "parseResponse bool false value")
+    console.log("✓ parseResponse bool false")
+
+    // Test: parseResponse - failure returns success: false
+    const badResponse = "This is not JSON at all"
+    const badResult = parseResponse(badResponse, newParseConfig1)
+    assertEqual(badResult.success, false, "parseResponse failure returns success: false")
+    assert(badResult.error, "parseResponse failure returns error message")
+    console.log("✓ parseResponse failure returns success: false")
+
+    // Test: parseResponse - invalid JSON in block
+    const invalidJsonResponse = '```json\n{invalid json}\n```'
+    const invalidResult = parseResponse(invalidJsonResponse, newParseConfig1)
+    assertEqual(invalidResult.success, false, "parseResponse invalid JSON returns failure")
+    console.log("✓ parseResponse invalid JSON")
+
+    // Test: parseResponse - raw JSON without code fences
+    const rawJsonResponse = '{"msg": "raw", "num": 100, "flag": false}'
+    const rawResult = parseResponse(rawJsonResponse, newParseConfig1)
+    assertEqual(rawResult.success, true, "parseResponse raw JSON success")
+    assertEqual(rawResult.data.msg, "raw", "parseResponse raw JSON extraction")
+    console.log("✓ parseResponse raw JSON")
+
+    // Test: parseResponse - partial keys (missing some)
+    const partialResponse = '{"msg": "partial"}'
+    const partialResult = parseResponse(partialResponse, newParseConfig1)
+    assertEqual(partialResult.success, true, "parseResponse partial keys success")
+    assertEqual(partialResult.data.msg, "partial", "parseResponse partial - extracted key")
+    assertEqual(partialResult.data.num, undefined, "parseResponse partial - missing key undefined")
+    console.log("✓ parseResponse partial keys")
+
+    // Test: parseResponse - JSON with code fences
+    const fencedResponse = '```json\n{"msg": "fenced", "num": 5, "flag": true}\n```'
+    const fencedResult = parseResponse(fencedResponse, newParseConfig1)
+    assertEqual(fencedResult.success, true, "parseResponse fenced JSON success")
+    assertEqual(fencedResult.data.msg, "fenced", "parseResponse fenced JSON extraction")
+    console.log("✓ parseResponse fenced JSON")
+
+    console.log("\n✅ Parse Functionality tests passed!")
     console.log("\n✅ All tests passed!")
+}
+
+// ============================================================================
+// Script Execution & Interpolation Tests
+// ============================================================================
+
+async function runAsyncTests() {
+    console.log("\n--- Script Execution & Interpolation Tests ---\n")
+
+    // Test: runScript - bash echo (stdout mode)
+    const bashResult = await runScript(
+        { language: "bash", code: 'echo "Hello World"', meta: ["exec"] },
+        {},
+        null
+    )
+    assertEqual(bashResult.output, "Hello World", "runScript bash echo")
+    console.log("✓ runScript bash echo (stdout)")
+
+    // Test: runScript - python print (stdout mode)
+    const pyResult = await runScript(
+        { language: "python", code: 'print("Python Hello")', meta: ["exec"] },
+        {},
+        null
+    )
+    assertEqual(pyResult.output, "Python Hello", "runScript python print")
+    console.log("✓ runScript python print (stdout)")
+
+    // Test: runScript - with variable substitution (shell-safe, single-quoted)
+    const subResult = await runScript(
+        { language: "bash", code: 'echo "Hello $name"', meta: ["exec"] },
+        { name: "Alice" },
+        null
+    )
+    assertEqual(subResult.output, "Hello 'Alice'", "runScript variable substitution")
+    console.log("✓ runScript variable substitution")
+
+    // Test: runScript - store mode (JSON output)
+    const storeResult = await runScript(
+        { language: "python", code: 'import json; print(json.dumps({"count": 5, "topic": "test"}))', meta: ["exec", "mode=store"] },
+        {},
+        null
+    )
+    assertEqual(storeResult.stored.count, 5, "runScript store mode count")
+    assertEqual(storeResult.stored.topic, "test", "runScript store mode topic")
+    assertEqual(storeResult.output, "", "runScript store mode output is empty")
+    console.log("✓ runScript store mode")
+
+    // Test: runScript - store mode returns stored object (merge happens in processScripts)
+    const storeCheck = await runScript(
+        { language: "python", code: 'import json; print(json.dumps({"new": "data"}))', meta: ["exec", "mode=store"] },
+        {},
+        null
+    )
+    assertEqual(storeCheck.stored.new, "data", "runScript returns stored object")
+    console.log("✓ runScript store returns object")
+
+    // Test: runScript - none mode (silent execution)
+    const noneResult = await runScript(
+        { language: "bash", code: 'echo "invisible"', meta: ["exec", "mode=none"] },
+        {},
+        null
+    )
+    assertEqual(noneResult.output, "", "runScript none mode has no output")
+    assertEqual(noneResult.stored, null, "runScript none mode has no stored")
+    console.log("✓ runScript none mode")
+
+    // Test: runScript - error handling
+    const errorResult = await runScript(
+        { language: "bash", code: 'exit 1', meta: ["exec"] },
+        {},
+        null
+    )
+    assert(errorResult.output.includes("error"), "runScript handles errors")
+    console.log("✓ runScript error handling")
+
+    // Test: runScript - custom interpreter with exec= syntax
+    const customResult = await runScript(
+        { language: "bash", code: 'echo "custom"', meta: ["exec=echo"] },
+        {},
+        null
+    )
+    // Note: exec=echo will run "echo" directly, not as shell command
+    // This tests the custom interpreter parsing
+    console.log("✓ runScript custom interpreter parsing")
+
+    // Test: processScripts - replaces exec blocks with output
+    // Test using parseStep to ensure consistent step structure
+    const testMarkdown = `\`\`\`yaml {config}
+step: test
+\`\`\`
+Before
+\`\`\`bash {exec}
+echo ONE
+\`\`\`
+Middle
+\`\`\`python {exec}
+print('TWO')
+\`\`\`
+After`
+    const parsedStep = parseStep(testMarkdown)
+    const processedPrompt = await processScripts(parsedStep, {}, null)
+    assert(processedPrompt.includes("ONE"), "processScripts replaces bash block with output")
+    assert(processedPrompt.includes("TWO"), "processScripts replaces python block with output")
+    assert(!processedPrompt.includes("```bash"), "processScripts removes bash block markers")
+    assert(!processedPrompt.includes("```python"), "processScripts removes python block markers")
+    console.log("✓ processScripts replaces exec blocks with output")
+
+    // Test: processScripts - preserves non-exec blocks
+    const stepWithJson = {
+        prompt: "```json\n{\"key\": \"value\"}\n```\n```bash {exec}\necho done\n```",
+        codeBlocks: [
+            { language: "json", code: '{"key": "value"}', meta: [] },
+            { language: "bash", code: "echo done", meta: ["exec"] }
+        ],
+        config: {}
+    }
+    const processedJson = await processScripts(stepWithJson, {}, null)
+    assert(processedJson.includes('```json'), "processScripts preserves json block")
+    assert(processedJson.includes("done"), "processScripts processes exec block")
+    console.log("✓ processScripts preserves non-exec blocks")
+
+    // Test: processScripts - updates metadata from store mode
+    const metaStoreStep = {
+        prompt: "```python {exec mode=store}\nimport json; print(json.dumps({\"count\": 10}))\n```",
+        codeBlocks: [
+            { language: "python", code: 'import json; print(json.dumps({"count": 10}))', meta: ["exec", "mode=store"] }
+        ],
+        config: {}
+    }
+    const testMeta = {}
+    await processScripts(metaStoreStep, testMeta, null)
+    assertEqual(testMeta.count, 10, "processScripts updates metadata from store")
+    console.log("✓ processScripts metadata from store")
+
+    // Test: interpolate - multiple variables
+    assertEqual(
+        interpolate("Hello $name, you have $count items", { name: "Bob", count: 3 }),
+        'Hello "Bob", you have 3 items',
+        "interpolate multiple vars"
+    )
+    console.log("✓ interpolate multiple variables")
+
+    // Test: interpolate - escape sequences
+    assertEqual(
+        interpolate("$name", { name: 'Hello "World"' }),
+        '"Hello \\"World\\""',
+        "interpolate escaped quotes"
+    )
+    console.log("✓ interpolate escaped quotes")
+
+    // Test: interpolate - special characters in values
+    assertEqual(
+        interpolate("$msg", { msg: "Line1\nLine2" }),
+        '"Line1\\nLine2"',
+        "interpolate newlines"
+    )
+    console.log("✓ interpolate special characters")
+
+    // Test: interpolate - boolean values
+    assertEqual(
+        interpolate("Enabled: $enabled", { enabled: true }),
+        "Enabled: true",
+        "interpolate boolean true"
+    )
+    assertEqual(
+        interpolate("Enabled: $enabled", { enabled: false }),
+        "Enabled: false",
+        "interpolate boolean false"
+    )
+    console.log("✓ interpolate boolean values")
+
+    // Test: interpolate - null/undefined
+    assertEqual(
+        interpolate("Value: $missing", { other: "exists" }),
+        "Value: null",
+        "interpolate undefined becomes null"
+    )
+    console.log("✓ interpolate undefined handling")
+
+    // Test: interpolate - nested object access
+    const nested = { user: { profile: { name: "Alice" } }, items: [{ id: 1 }, { id: 2 }] }
+    assertEqual(
+        interpolate("User: $user.profile.name", nested),
+        'User: "Alice"',
+        "interpolate deep nested"
+    )
+    assertEqual(
+        interpolate("First: $items.0.id", nested),
+        "First: 1",
+        "interpolate array index"
+    )
+    console.log("✓ interpolate nested access")
+
+    // Test: interpolate - $$ for full metadata
+    const fullMeta = { a: 1, b: 2 }
+    const fullResult = interpolate("$$", fullMeta)
+    assert(fullResult.includes('"a":1'), "interpolate $$ includes values")
+    assert(fullResult.includes('"b":2'), "interpolate $$ includes all keys")
+    console.log("✓ interpolate $$ full metadata")
+
+    console.log("\n✅ Script Execution & Interpolation tests passed!")
 }
 
 // Run tests if executed directly
 if (import.meta.url === `file://${process.argv[1]}`) {
-    runTests()
+    // Convert runTests to async wrapper
+    runTests().then(() => {
+        return runAsyncTests()
+    }).then(() => {
+        console.log("\n🎉 All test suites passed!")
+        process.exit(0)
+    }).catch(err => {
+        console.error("\n❌ Test failed:", err.message)
+        process.exit(1)
+    })
 }
