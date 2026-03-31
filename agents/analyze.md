@@ -6,6 +6,7 @@ permission:
     read: allow
     glob: allow
     list: allow
+    grep: allow
     websearch: allow
     codesearch: allow
     webfetch: allow
@@ -18,7 +19,6 @@ permission:
         git ls *: allow
         git status *: allow
         todowrite *: allow
-        uv run .opencode/bin/*: allow
     task:
         scout: allow
         investigator: allow

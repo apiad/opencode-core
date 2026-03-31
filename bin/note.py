@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
+# dependencies = [
+#     "microcli-toolkit",
+# ]
 # ///
 
 """note - Create structured notes with YAML frontmatter.
@@ -13,9 +16,6 @@ Commands:
 """
 from pathlib import Path
 import sys
-
-# Use local microcli from lib/
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "lib/microcli/src"))
 
 import microcli as m
 from datetime import datetime
