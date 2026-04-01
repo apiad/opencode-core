@@ -1,0 +1,42 @@
+# OpenCode Sandbox - Base Template Environment
+# This image includes only basic tools.
+# Create a new Dockerfile based on this with the necessary modifications.
+
+FROM ubuntu:24.04
+
+# ============================================================
+# System tools and utilities
+# ============================================================
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    wget \
+    bash \
+    bash-completion \
+    coreutils \
+    findutils \
+    grep \
+    sed \
+    awk \
+    vim \
+    less \
+    man-db \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    && rm -rf /var/lib/apt/lists/*
+
+# ============================================================
+# Project workspace
+# ============================================================
+
+# Make sure you copy this section VERBATIM.
+# This is necessary for the sandbox.sh command to work.
+
+WORKDIR /project
+
+# Default shell
+SHELL ["/bin/bash", "-c"]
+
+# Default command
+CMD ["/bin/bash"]

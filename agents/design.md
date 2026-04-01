@@ -8,9 +8,7 @@ permission:
     list: allow
     grep: allow
     edit:
-        .knowledge/plans/*: allow
-        .knowledge/design/*: allow
-        .knowledge/notes/*: allow
+        .knowledge/*: allow
     bash: allow # All bash commands routed via sandbox plugin (minimal access)
     task:
         investigator: allow

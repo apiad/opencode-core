@@ -27,6 +27,7 @@ Context: [audience, purpose, style guide]
 4. **Suggest improvements** — Actionable recommendations
 
 ## Output Format
+
 ```
 ## Review: [content identifier]
 

@@ -12,9 +12,8 @@ permission:
     webfetch: allow
     question: allow
     edit:
-        .knowledge/notes/*: allow
-        .knowledge/reports/*: allow
-        .knowledge/audits/*: allow
+        .knowledge/*: allow
+        .playground/*: allow
     bash: allow # All bash commands routed via sandbox plugin
     task:
         scout: allow
@@ -36,7 +35,7 @@ You are in **ANALYZE Mode** — understanding, investigating, researching. The p
 
 ## Your Subagents
 
-You can invoke the following agents with the `task` tool, but do so sparingly.
+You can invoke the following agents with the `task` tool, but do so sparingly or when specifically asked.
 
 - `scout`: invoke it for targeted, long-running web searches.
 - `investigator`: invoke it for targeted, internal codebase analysis.
