@@ -14,11 +14,11 @@ PLAYGROUND_DIR="$PROJECT_DIR/.playground"
 KNOWLEDGE_DIR="$PROJECT_DIR/.knowledge"
 
 # Get current user for permission correctness
-UID=$(id -u)
-GID=$(id -g)
+MYUID=$(id -u)
+MYGID=$(id -g)
 
 # Default to root group if GID is empty
-GID="${GID:-0}"
+MYGID="${MYGID:-0}"
 
 # Build mounts based on mode
 case "$MODE" in
@@ -44,6 +44,37 @@ case "$MODE" in
     ;;
 esac
 
+# Get project name for image detection
+PROJECT_NAME=$(basename "$PWD")
+SANDBOX_IMAGE="${PROJECT_NAME}-sandbox"
+
+# Check if Docker is available
+if ! command -v docker &> /dev/null; then
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  ⚠️  WARNING: Sandbox is not setup                             "
+    echo "                                                                "
+    echo "  Docker is not installed or not in PATH.                       "
+    echo "  Running command directly without isolation...                 "
+    echo "════════════════════════════════════════════════════════════════"
+    echo ""
+    exec bash -c "$*"
+fi
+
+# Check if the sandbox image exists
+if ! docker image inspect "$SANDBOX_IMAGE" &> /dev/null; then
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  ⚠️  WARNING: Sandbox is not setup                             "
+    echo "                                                                "
+    echo "  Docker image '$SANDBOX_IMAGE' not found.                      "
+    echo "  Run '/sandbox' and build the sandbox image first.             "
+    echo "  Running command directly without isolation...                 "
+    echo "════════════════════════════════════════════════════════════════"
+    echo ""
+    exec bash -c "$*"
+fi
+
 # Check if playground exists, create if not
 if [ ! -d "$PLAYGROUND_DIR" ]; then
     mkdir -p "$PLAYGROUND_DIR"
@@ -56,12 +87,12 @@ fi
 
 # Run the command in Docker with appropriate mounts
 docker run --rm \
-    --user "$UID:$GID" \
+    --user "$MYUID:$MYGID" \
     --network host \
     -m 2g \
     $PROJECT_MOUNT \
     $PLAYGROUND_MOUNT \
     $KNOWLEDGE_MOUNT \
     -w /project \
-    opencode-sandbox \
-    bash -c "$@"
+    "$SANDBOX_IMAGE" \
+    bash -c "$*"

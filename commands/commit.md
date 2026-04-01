@@ -1,6 +1,6 @@
 ---
 description: Commit changes with validation
-agent: release
+agent: create
 subagents: []
 ---
 

@@ -1,6 +1,6 @@
 ---
 description: Version, tag, and deploy release
-agent: release
+agent: create
 subagents: []
 ---
 

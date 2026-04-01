@@ -1,6 +1,6 @@
 ---
 description: Create structured, actionable plan with YAML frontmatter
-agent: plan
+agent: design
 subagents: [investigator]
 ---
 

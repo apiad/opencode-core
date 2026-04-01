@@ -1,6 +1,6 @@
 ---
 description: Fix bug with regression test
-agent: build
+agent: create
 subagents: [tester]
 ---
 

@@ -1,6 +1,6 @@
 ---
 description: Implement feature using TCR discipline
-agent: build
+agent: create
 subagents: [tester]
 ---
 

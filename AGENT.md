@@ -77,6 +77,8 @@ These run directly on the host (fast, no isolation):
 - `git status`, `git log`, `git diff`, `git show`
 - `pwd`, `which`, `cd`
 
+**NOTE:** All shell commands must be run with **relative paths** rooted at the project base directory. This is because shell commands are run inside a Docker container, in `/project` workdir, so all relative paths inside the project are kept, but absolute paths, and any path outside the project are disabled.
+
 ---
 
 ## Primary Mode Registry

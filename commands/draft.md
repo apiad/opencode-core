@@ -1,6 +1,6 @@
 ---
 description: Create content with iterative drafting
-agent: build
+agent: create
 subagents: [drafter, critic]
 ---
 

@@ -1,6 +1,6 @@
 ---
 description: Generate project structure from template
-agent: plan
+agent: design
 subagents: []
 ---
 
