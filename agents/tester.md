@@ -5,7 +5,7 @@ permission:
     "*": deny
     read: allow
     edit:
-        .experiments/*: allow
+        .playground/*: allow
 ---
 
 # Tester Subagent
@@ -49,7 +49,7 @@ Context: [relevant code context]
 ```
 
 ## Key Mandates
-- **Write to `.experiments/tests/` only** — Never project files
+- **Write to `.playground/tests/` only** — Never project files
 - **Minimal tests** — Quick validation, not comprehensive suite
 - **Clear results** — Parent decides what to do with findings
 - **60 second timeout** — Fast feedback

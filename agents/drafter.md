@@ -39,7 +39,7 @@ status: [draft / needs_review]
 ```
 
 ## Key Mandates
-- **Write to `.experiments/drafts/` only** — Never project files
+- **Write to `.playground/drafts/` only** — Never project files
 - **Section-sized work** — Not full documents
 - **Match context** — Consistent with existing style
 - **60 second timeout** — Quick iteration

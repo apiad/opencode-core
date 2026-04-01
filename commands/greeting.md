@@ -1,1 +1,0 @@
-../../lib/opencode-literate-commands/examples/greeting.md

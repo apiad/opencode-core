@@ -23,10 +23,11 @@ Every agent MUST follow these:
 | Path | Purpose | Created by |
 |------|---------|------------|
 | `.knowledge/notes/*` | Analysis outputs (research, audits, investigations) | analyze agent |
-| `.knowledge/plans/` | Action plans | plan agent |
-| `.knowledge/log/` | Chronological activity log | release agent |
-| `.experiments/` | Subagent scratch space (gitignored) | subagents |
-| `docs/` | Project documentation | build agent |
+| `.knowledge/plans/*` | Action plans | design agent |
+| `.knowledge/design/*` | Design documents and architecture | design agent |
+| `.knowledge/reports/*` | Analysis reports | analyze agent |
+| `.playground/*` | Subagent scratch space, experiments | subagents, analyze |
+| `docs/` | Project documentation | create agent |
 
 ---
 
@@ -40,31 +41,80 @@ Every agent MUST follow these:
 ### External Dependencies
 | Tool | Used by | Required? |
 |------|---------|-----------|
-| `git` | release, build | Yes |
-| `gh` | analyze (todo) | No |
-| `make` | build, release | Yes |
+| `git` | create | Yes |
+| `gh` | analyze | No |
+| `make` | create | Yes |
 | `uv`/`npm`/`cargo` | project-specific | No |
 
 ---
 
-## Primary Agent Registry (Modes)
+## Sandbox System
 
-| Agent | Purpose | Permissions |
-|-------|---------|-------------|
-| `analyze` | Understand, investigate, research | Read-only on project files; write to `.knowledge/notes/` |
-| `plan` | Decide approach, design architecture | Read-only on project files; write to `.knowledge/plans/` |
-| `build` | Execute, implement, create | Full write access to project files |
-| `release` | Finalize, commit, publish | Full write access; git operations |
+All shell commands run in Docker containers for isolation. The sandbox plugin
+automatically routes commands through `.opencode/sandbox/sandbox.sh`.
 
-### Mode Detection
+### Mount Matrix
 
-Modes are detected from user intent:
-- Questions, research requests → **ANALYZE**
-- Strategy discussions, "should we..." → **PLAN**
-- Implementation requests → **BUILD**
-- Commit/release requests → **RELEASE**
+| Mode | Project | .playground | .knowledge |
+|------|---------|------------|------------|
+| analyze | :ro | :rw | :rw |
+| design | :ro | :ro | :rw |
+| create | :rw | :rw | :rw |
 
-Users can also use explicit `/command` which runs in the corresponding mode.
+### Sandboxed Commands
+
+Commands that need isolation (language runtimes, installers, build tools):
+- `python`, `pip`, `uv`
+- `node`, `npm`, `yarn`, `pnpm`, `bun`
+- `cargo`, `rustc`
+- `go`
+- `make`, `cmake`
+
+### Host Commands
+
+These run directly on the host (fast, no isolation):
+- `ls`, `grep`, `find`, `cat`, `head`, `tail`
+- `git status`, `git log`, `git diff`, `git show`
+- `pwd`, `which`, `cd`
+
+---
+
+## Primary Mode Registry
+
+### Analyze Mode
+- **Purpose**: Understand, investigate, research
+- **Permissions**: Read-only on project files; write to `.knowledge/notes/`, `.knowledge/reports/`, `.playground/`
+- **Sandbox**: Project :ro, .playground :rw, .knowledge :rw
+- **Subagents**: scout, investigator, critic
+
+### Design Mode
+- **Purpose**: Design architecture, create plans, make strategic decisions
+- **Permissions**: Read-only on project files; write to `.knowledge/plans/`, `.knowledge/design/`
+- **Sandbox**: Project :ro, .playground :ro, .knowledge :rw
+- **Subagents**: investigator
+
+### Create Mode
+- **Purpose**: Implement, create, make changes
+- **Permissions**: Full write access to project files
+- **Sandbox**: Project :rw, .playground :rw, .knowledge :rw
+- **Subagents**: tester, drafter, general
+
+---
+
+## Mode Switching
+
+Modes are manual entry points via commands:
+
+| Command | Switches to |
+|---------|-------------|
+| `/analyze` | Analyze mode |
+| `/design` | Design mode |
+| `/create` | Create mode |
+
+Users can also trigger mode detection from intent:
+- Questions, research → **Analyze**
+- Strategy discussions → **Design**
+- Implementation requests → **Create**
 
 ---
 
@@ -73,16 +123,16 @@ Users can also use explicit `/command` which runs in the corresponding mode.
 | Subagent | Purpose | Used By | Writes To |
 |----------|---------|---------|-----------|
 | `scout` | Web research | analyze | Returns to parent only |
-| `investigator` | Codebase analysis | analyze, plan | Returns to parent only |
-| `tester` | Hypothesis validation | build | `.experiments/tests/` |
-| `drafter` | Content drafting | build | `.experiments/drafts/` |
-| `critic` | Prose review | analyze, build | Returns to parent only |
+| `investigator` | Codebase analysis | analyze, design | Returns to parent only |
+| `critic` | Prose review | analyze | Returns to parent only |
+| `tester` | Hypothesis validation | create | `.playground/tests/` |
+| `drafter` | Content drafting | create | `.playground/drafts/` |
 
 ### Subagent Rules
 
 1. **Never write to project files** — Only parent agents commit changes
 2. **Never write to `.knowledge/`** — Parent owns knowledge architecture
-3. **Can write to `.experiments/`** — Scratch space, gitignored
+3. **Can write to `.playground/`** — Scratch space, gitignored
 4. **Must return structured output** — Parent synthesizes results
 5. **60 second timeout** — Fast feedback
 6. **No nesting** — Subagents cannot spawn subagents
@@ -91,37 +141,44 @@ Users can also use explicit `/command` which runs in the corresponding mode.
 
 ## Command Registry
 
-### ANALYZE Commands
+### Mode Entry Commands
+
+| Command | Mode | Description |
+|---------|------|-------------|
+| `/analyze` | analyze | Switch to Analyze mode |
+| `/design` | design | Switch to Design mode |
+| `/create` | create | Switch to Create mode |
+
+### Analyze Commands
 
 | Command | Description |
 |---------|-------------|
 | `/research [topic]` | Deep research with parallel scouts |
 | `/audit [scope]` | Comprehensive codebase audit |
 | `/investigate [problem]` | Root cause analysis |
-| `/todo` | List GitHub issues |
 | `/onboard` | Project orientation |
 
-### PLAN Commands
+### Design Commands
 
 | Command | Description |
 |---------|-------------|
 | `/plan [description]` | Create structured plan |
 | `/scaffold [template]` | Generate project structure |
 
-### BUILD Commands
+### Create Commands
 
 | Command | Description |
 |---------|-------------|
 | `/build [feature]` | TCR implementation |
 | `/fix [bug]` | Bug fix with regression test |
 | `/draft [content]` | Content creation |
+| `/commit [message]` | Commit with validation |
 
-### RELEASE Commands
+### Infrastructure Commands
 
 | Command | Description |
 |---------|-------------|
-| `/commit [message]` | Commit with validation |
-| `/publish [version]` | Version, tag, deploy |
+| `/sandbox-setup` | Detect dependencies and build Docker image |
 
 ### Freestyle vs Commands
 
@@ -134,14 +191,14 @@ Both work in any mode, but commands add discipline and constraints.
 
 ## YAML Frontmatter Standard
 
-All `.knowledge/` files must include:
+All `.knowledge/` files should include:
 
 ```yaml
 ---
 id: kebab-case-identifier
 created: YYYY-MM-DD
 modified: YYYY-MM-DD
-type: research | audit | investigation | plan | log
+type: research | audit | investigation | plan | design | log
 status: active | stale | archived
 # Optional:
 issue: 42
@@ -165,4 +222,4 @@ Agent explains its reasoning. User can override at any time.
 
 ---
 
-*Framework Version: 2.0*
+*Framework Version: 3.0*
