@@ -7,6 +7,7 @@ permission:
     glob: allow
     list: allow
     grep: allow
+    skill: allow
     edit:
         .knowledge/*: allow
     bash: allow # All bash commands routed via sandbox plugin (minimal access)

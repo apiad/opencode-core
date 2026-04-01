@@ -11,6 +11,7 @@ permission:
     codesearch: allow
     webfetch: allow
     question: allow
+    skill: allow
     edit:
         .knowledge/*: allow
         .playground/*: allow

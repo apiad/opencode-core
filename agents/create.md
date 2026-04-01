@@ -3,11 +3,6 @@ description: Implement, create, make changes
 mode: primary
 permission:
     "*": allow
-    task:
-        "*": deny
-        tester: allow
-        drafter: allow
-        general: allow
 ---
 
 # CREATE Mode
